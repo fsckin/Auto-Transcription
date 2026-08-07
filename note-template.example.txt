@@ -1,0 +1,31 @@
+---
+date: {{date}}
+time_recorded: {{time_recorded}}
+source: "Sony ICD-UX570"
+original_file: {{original_file}}
+original_path: {{original_path}}
+file_hash: {{file_hash}}
+audio_duration_seconds: {{duration_seconds}}
+language: {{language}}
+transcription_backend: {{backend}}
+transcription_model: {{model}}
+transcription_version: {{model_version}}
+transcription_seconds: {{transcription_seconds}}
+summary_model: {{summary_model}}
+summary_seconds: {{summary_seconds}}
+processed_at: {{processed_at}}
+tags:
+  - recording/transcribed
+---
+
+{{title_heading}}
+
+{{audio_link}}
+
+## Summary
+
+{{summary}}
+
+## Full Transcript
+
+{{transcript}}

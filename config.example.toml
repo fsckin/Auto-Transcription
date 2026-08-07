@@ -1,0 +1,71 @@
+[paths]
+mount_point = "/Volumes/IC RECORDER"
+recorder_subdir = "REC_FILE"
+vault = "~/Obsidian/Main"
+recordings_folder = "Recordings"
+state_root = "~/Library/Application Support/AutoTranscription"
+attachments_folder = "Recordings/Audio"
+
+[import]
+archive_audio = true
+copy_audio_to_vault = false
+stable_wait_seconds = 1.0
+retry_count = 2
+copy_timeout_seconds = 1800
+keep_audio = true
+discard_after_days = 0
+
+[transcription]
+backend = "auto"
+# Low-memory/fast default. Use --maximum-accuracy explicitly for large-v3.
+model = "small"
+retry_model = "small"
+hybrid_retry = false
+confidence_threshold = -0.80
+language = "en"
+initial_prompt = ""
+word_timestamps = false
+vad_enabled = true
+vad_noise_db = -40.0
+vad_min_silence_seconds = 1.0
+vad_padding_seconds = 0.25
+# Optional FFmpeg audio filter. Leave empty unless testing proves it helps.
+audio_filter = ""
+device = "auto"
+# Long audio is decoded and transcribed one bounded chunk at a time. These
+# defaults keep peak memory predictable on a 16 GB Apple Silicon Mac.
+chunk_seconds = 900.0
+chunk_overlap_seconds = 2.0
+max_direct_seconds = 900.0
+# Applied to each bounded chunk, not the entire multi-hour recording.
+timeout_seconds = 14400
+
+[summarization]
+enabled = true
+model = "mistral"
+ollama_url = "http://127.0.0.1:11434"
+chunk_chars = 24000
+timeout_seconds = 600
+retry_count = 3
+prompt = ""
+# Retained only while summarizing one recording; the model is explicitly unloaded afterward.
+keep_alive = "2m"
+# If the local API is unavailable, start `ollama serve` and wait this long.
+startup_timeout_seconds = 30
+
+[output]
+# template = "~/path/to/custom-note-template.md"
+generate_title = false
+
+[behavior]
+notify = true
+prevent_sleep = true
+# After a non-dry-run `run` succeeds with zero failures, unmount the recorder volume.
+unmount_on_success = true
+# 20 is macOS's lowest CPU scheduling priority; child processes inherit it.
+nice_level = 20
+log_max_bytes = 2000000
+log_backups = 3
+
+[corrections]
+# "frequent mistranscription" = "preferred spelling"
