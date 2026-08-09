@@ -1,7 +1,9 @@
 [paths]
 mount_point = "/Volumes/IC RECORDER"
 recorder_subdir = "REC_FILE"
-vault = "~/Obsidian/Main"
+# Discover the active vault from Obsidian's local registry. A concrete path or
+# --vault always overrides discovery.
+vault = "auto"
 recordings_folder = "Recordings"
 state_root = "~/Library/Application Support/AutoTranscription"
 attachments_folder = "Recordings/Audio"
@@ -36,6 +38,11 @@ confidence_threshold = -0.80
 language = "en"
 initial_prompt = ""
 word_timestamps = false
+# Prevent one bad 30-second window from feeding a hallucinated phrase into the
+# rest of the recording. Unresolved high-compression loops are removed.
+condition_on_previous_text = false
+compression_ratio_threshold = 2.4
+no_speech_threshold = 0.6
 vad_enabled = true
 vad_noise_db = -40.0
 vad_min_silence_seconds = 1.0
@@ -58,6 +65,22 @@ chunk_seconds = 900.0
 chunk_overlap_seconds = 2.0
 max_direct_seconds = 900.0
 # Applied to each bounded chunk, not the entire multi-hour recording.
+timeout_seconds = 14400
+
+[diarization]
+# "auto" adds Person 1 / Person 2 turns when both model files are installed,
+# and otherwise continues normally. Use "on" to treat missing models as an error
+# or "off" to disable speaker detection.
+mode = "auto"
+# model_dir = "~/Library/Application Support/AutoTranscription/Models/Diarization"
+# - sherpa-onnx-pyannote-segmentation-3-0/model.int8.onnx
+# - nemo_en_titanet_small.onnx
+# A known count bypasses threshold guessing, which can badly over-cluster long
+# recordings. Set this to -1 only when the speaker count is truly unknown.
+num_speakers = 2
+cluster_threshold = 0.5
+# One CPU thread plus the application's nice=20 keeps this background-friendly.
+threads = 1
 timeout_seconds = 14400
 
 [summarization]

@@ -106,6 +106,137 @@ class AutoTranscriptionTests(unittest.TestCase):
         self.assertFalse(cfg.hybrid_retry)
         self.assertEqual(cfg.nice_level, 20)
         self.assertTrue(cfg.unmount_on_success)
+        self.assertTrue(cfg.vault_auto)
+        self.assertFalse(cfg.condition_on_previous_text)
+        self.assertEqual(cfg.compression_ratio_threshold, 2.4)
+        self.assertEqual(cfg.diarization_mode, "auto")
+        self.assertEqual(cfg.diarization_threads, 1)
+
+    def test_repetition_loop_is_removed_after_decoder_fallback(self) -> None:
+        result = {
+            "text": "good speech " + "a little bit " * 500,
+            "language": "en",
+            "segments": [
+                {"start": 0, "end": 2, "text": " good speech", "compression_ratio": 1.1,
+                 "no_speech_prob": 0.01},
+                {"start": 2, "end": 32, "text": " a little bit" * 500,
+                 "compression_ratio": 18.0, "no_speech_prob": 0.2},
+            ],
+        }
+        cleaned = at.remove_repetition_hallucinations(result, 2.4, 0.6)
+        self.assertEqual(cleaned["text"], "good speech")
+        self.assertEqual(len(cleaned["segments"]), 1)
+
+    def test_speaker_transcript_assigns_words_and_uses_first_appearance_labels(self) -> None:
+        result = {
+            "text": "Hello there Hi again Welcome back",
+            "language": "en",
+            "segments": [{
+                "start": 0, "end": 3, "text": " Hello there Hi again Welcome back",
+                "words": [
+                    {"start": 0.1, "end": 0.4, "word": " Hello"},
+                    {"start": 0.4, "end": 0.8, "word": " there"},
+                    {"start": 1.1, "end": 1.4, "word": " Hi"},
+                    {"start": 1.4, "end": 1.8, "word": " again"},
+                    {"start": 2.1, "end": 2.5, "word": " Welcome"},
+                    {"start": 2.5, "end": 2.8, "word": " back"},
+                ],
+            }],
+        }
+        spans = [
+            {"start": 0, "end": 1, "speaker": 8},
+            {"start": 1, "end": 2, "speaker": 3},
+            {"start": 2, "end": 3, "speaker": 8},
+        ]
+        text, turns = at.speaker_transcript(result, spans, {"Welcome": "Glad you're"})
+        self.assertEqual(
+            text,
+            "Person 1: Hello there\n\nPerson 2: Hi again\n\nPerson 1: Glad you're back",
+        )
+        self.assertEqual([turn["speaker"] for turn in turns], [1, 2, 1])
+
+    def test_compact_diarization_restores_original_timestamps(self) -> None:
+        intervals = [[10.0, 20.0], [100.0, 110.0]]
+        compact = [
+            {"start": 2.0, "end": 4.0, "speaker": 0},
+            {"start": 12.0, "end": 14.0, "speaker": 1},
+        ]
+        restored = at.Diarizer.restore_timestamps(compact, intervals)
+        self.assertEqual(restored, [
+            {"start": 12.0, "end": 14.0, "speaker": 0},
+            {"start": 101.0, "end": 103.0, "speaker": 1},
+        ])
+
+    def test_obsidian_vault_discovery_prefers_the_open_valid_vault(self) -> None:
+        root = Path(self.temp.name) / "obsidian-discovery"
+        closed = root / "Closed Vault"
+        opened = root / "iCloud Vault"
+        for vault in (closed, opened):
+            (vault / ".obsidian").mkdir(parents=True)
+        registry = root / "obsidian.json"
+        registry.write_text(json.dumps({"vaults": {
+            "closed": {"path": str(closed), "open": False},
+            "opened": {"path": str(opened), "open": True},
+        }}), encoding="utf-8")
+
+        self.assertEqual(at.discover_obsidian_vault(registry), opened.resolve())
+
+    def test_obsidian_vault_discovery_uses_the_only_valid_vault(self) -> None:
+        root = Path(self.temp.name) / "single-vault"
+        vault = root / "Vault"
+        (vault / ".obsidian").mkdir(parents=True)
+        registry = root / "obsidian.json"
+        registry.write_text(json.dumps({"vaults": {
+            "valid": {"path": str(vault)},
+            "missing": {"path": str(root / "Missing"), "open": True},
+        }}), encoding="utf-8")
+
+        self.assertEqual(at.discover_obsidian_vault(registry), vault.resolve())
+
+    def test_obsidian_vault_discovery_refuses_ambiguous_vaults(self) -> None:
+        root = Path(self.temp.name) / "ambiguous-vaults"
+        first = root / "First"
+        second = root / "Second"
+        for vault in (first, second):
+            (vault / ".obsidian").mkdir(parents=True)
+        registry = root / "obsidian.json"
+        registry.write_text(json.dumps({"vaults": {
+            "first": {"path": str(first)},
+            "second": {"path": str(second)},
+        }}), encoding="utf-8")
+
+        with self.assertRaisesRegex(at.PipelineError, "ambiguous"):
+            at.discover_obsidian_vault(registry)
+
+    def test_explicit_vault_overrides_automatic_discovery(self) -> None:
+        root = Path(self.temp.name) / "explicit-vault"
+        config = root / "config.toml"
+        root.mkdir()
+        config.write_text(f'[paths]\nvault = "{root / "Vault"}"\n', encoding="utf-8")
+        cfg = at.apply_overrides(at.load_config(config), at.build_parser().parse_args(["status"]))
+
+        self.assertFalse(cfg.vault_auto)
+        self.assertEqual(at.resolve_vault(cfg, root / "missing-registry.json"), (root / "Vault").resolve())
+
+    def test_cli_uses_automatically_discovered_vault(self) -> None:
+        root = Path(self.temp.name) / "auto-vault-cli"
+        vault = root / "iCloud Vault"
+        (vault / ".obsidian").mkdir(parents=True)
+        registry = root / "obsidian.json"
+        registry.write_text(json.dumps({"vaults": {
+            "active": {"path": str(vault), "open": True},
+        }}), encoding="utf-8")
+
+        with mock.patch.object(at, "OBSIDIAN_REGISTRY", registry), \
+                mock.patch.object(at, "apply_process_priority", return_value=20):
+            result = at.main([
+                "--mount", str(root / "recorder"),
+                "--state-root", str(root / "state"),
+                "--backend", "mock", "--no-summary", "--no-notify", "--quiet", "status",
+            ])
+
+        self.assertEqual(result, 0)
+        self.assertTrue((vault / "Recordings").is_dir())
 
     def test_process_priority_is_lowered_to_configured_nice_level(self) -> None:
         with mock.patch.object(at.os, "getpriority", side_effect=[0, 20]), \
@@ -255,6 +386,34 @@ class AutoTranscriptionTests(unittest.TestCase):
         self.assertTrue(Path(row["note_path"]).exists())
         self.assertEqual(self.pipeline.import_new()["found"], 0)
         self.assertEqual(self.pipeline.process_pending(), {"completed": 0, "failed": 0})
+
+    def test_pipeline_writes_speaker_transcript_and_uses_it_in_note(self) -> None:
+        self.audio("two-people.mp3")
+        self.pipeline.import_new()
+        self.cfg.diarization_mode = "on"
+        spans = [{"start": 0.0, "end": 1.0, "speaker": 4}]
+        with mock.patch.object(at, "diarization_enabled", return_value=True), \
+                mock.patch.object(at.Diarizer, "diarize", return_value=spans):
+            self.assertEqual(self.pipeline.process_pending(), {"completed": 1, "failed": 0})
+        row = self.latest_row()
+        speaker_path = Path(row["speaker_transcript_path"])
+        self.assertTrue(speaker_path.is_file())
+        self.assertIn("Person 1: Mock transcript", speaker_path.read_text(encoding="utf-8"))
+        self.assertIn("Person 1: Mock transcript", Path(row["note_path"]).read_text(encoding="utf-8"))
+
+    def test_reprocess_removes_reproducible_outputs_but_preserves_note(self) -> None:
+        self.audio("reprocess.mp3")
+        self.pipeline.import_new()
+        self.pipeline.process_pending()
+        row = self.latest_row()
+        generated = [Path(row[field]) for field in (
+            "transcript_path", "cleaned_transcript_path", "segments_path", "summary_path",
+        )]
+        note = Path(row["note_path"])
+        at.reset_for_reprocess(self.db, row["sha256"][:8], self.logger)
+        self.assertTrue(all(not path.exists() for path in generated))
+        self.assertTrue(note.exists())
+        self.assertEqual(self.db.get(int(row["id"]))["status"], "ready")
 
     def test_scan_uses_apple_metadata_header_not_filename_alone(self) -> None:
         self.audio("._named-sidecar.mp3", self.APPLEDOUBLE_HEADER)
@@ -525,7 +684,9 @@ class AutoTranscriptionTests(unittest.TestCase):
         root = Path(self.temp.name) / "resettable-state"
         (root / "Chunks" / "hash").mkdir(parents=True)
         (root / "state.sqlite3").write_bytes(b"state")
-        self.assertEqual(at.main(["--state-root", str(root), "--reset-state"]), 0)
+        self.assertEqual(at.main([
+            "--state-root", str(root), "--vault", str(self.cfg.vault), "--reset-state",
+        ]), 0)
         self.assertFalse(root.exists())
         self.assertTrue(self.cfg.vault.exists())
         self.assertTrue(self.cfg.recorder_folder.exists())
@@ -887,6 +1048,9 @@ class AutoTranscriptionTests(unittest.TestCase):
         self.assertIn("no_text_retries", columns)
         self.assertIn("next_retry_at", columns)
         self.assertIn("audio_quality_json", columns)
+        self.assertIn("speaker_transcript_path", columns)
+        self.assertIn("diarization_segments_path", columns)
+        self.assertIn("diarize_seconds", columns)
         self.assertEqual(len(list((path.parent / "Backups").glob("state-pre-migration-*.sqlite3"))), 1)
 
     def test_state_maintenance_removes_only_safe_generated_files(self) -> None:

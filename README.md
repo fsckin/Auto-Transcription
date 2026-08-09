@@ -31,6 +31,14 @@ The compatibility launcher also accepts the original two positional arguments:
 ./transcribe_and_summarize.sh "/Volumes/IC RECORDER" "$HOME/Obsidian/Main"
 ```
 
+When no concrete vault is configured, Auto-Transcription reads Obsidian's local
+vault registry and selects the single vault marked open. If only one valid vault
+is registered, it uses that vault. Discovery validates both the vault directory
+and its `.obsidian` marker and stops with an actionable error instead of guessing
+when multiple vaults are ambiguous. An explicit `--vault` or `[paths].vault`
+always takes precedence. This supports iCloud vaults at their actual macOS path,
+including `~/Library/Mobile Documents/iCloud~md~obsidian/Documents/...`.
+
 For complete CLI control, use `auto_transcription.py` directly. Global options come before the command:
 
 ```sh
@@ -72,7 +80,7 @@ Copy `config.example.toml` to:
 
 Alternatively, pass `--config /path/to/config.toml`.
 
-The configuration controls paths, language, model selection, confidence retry, bounded audio chunking, silence-aware voice detection, optional FFmpeg filtering, Ollama prompts, correction terms, audio retention, templates, notifications, and timeouts.
+The configuration controls paths, language, model selection, confidence retry, bounded audio chunking, silence-aware voice detection, optional FFmpeg filtering, Ollama prompts, correction terms, audio retention, templates, notifications, and timeouts. Set `paths.vault = "auto"` (the default) to discover the current Obsidian vault from `~/Library/Application Support/obsidian/obsidian.json`, or provide a concrete path to pin one vault.
 
 `default-note-template.txt` is the single default template and lists every supported variable. It records the source path and timestamp, content hash, audio duration and quality measurements, language, transcription backend/model/version, stage timings, summary model, and processing timestamp. Copy it elsewhere and set `output.template` to customize it.
 

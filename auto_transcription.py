@@ -31,20 +31,26 @@ from typing import Any, Iterator, Sequence
 import urllib.error
 import urllib.parse
 import urllib.request
+import zlib
 
 
 APP_NAME = "auto-transcription"
-APP_VERSION = "3.0.1"
-DB_SCHEMA_VERSION = 3
+APP_VERSION = "3.2.0"
+DB_SCHEMA_VERSION = 4
 AUDIO_SUFFIXES = {".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg"}
 FINAL_STATES = {"completed", "duplicate", "ignored", "no_speech", "needs_review"}
 LAUNCHD_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+OBSIDIAN_REGISTRY = Path.home() / "Library" / "Application Support" / "obsidian" / "obsidian.json"
 APPLE_METADATA_MAGICS = {b"\x00\x05\x16\x00", b"\x00\x05\x16\x07"}
 APPLE_METADATA_VERSIONS = {b"\x00\x01\x00\x00", b"\x00\x02\x00\x00"}
 
 
 class PipelineError(RuntimeError):
     """An expected, user-actionable pipeline failure."""
+
+
+class PipelineBusyError(PipelineError):
+    """Another healthy pipeline process already owns the singleton lock."""
 
 
 class NeedsReviewError(PipelineError):
@@ -56,6 +62,7 @@ class Config:
     mount_point: Path = Path("/Volumes/IC RECORDER")
     recorder_subdir: str = "REC_FILE"
     vault: Path = Path.home() / "Obsidian" / "Main"
+    vault_auto: bool = True
     recordings_folder: str = "Recordings"
     state_root: Path = Path.home() / "Library" / "Application Support" / "AutoTranscription"
     archive_audio: bool = True
@@ -81,6 +88,9 @@ class Config:
     language: str | None = "en"
     initial_prompt: str = ""
     word_timestamps: bool = False
+    condition_on_previous_text: bool = False
+    compression_ratio_threshold: float = 2.4
+    no_speech_threshold: float = 0.6
     vad_enabled: bool = True
     vad_noise_db: float = -40.0
     vad_min_silence_seconds: float = 1.0
@@ -98,6 +108,14 @@ class Config:
     chunk_overlap_seconds: float = 2.0
     max_direct_seconds: float = 900.0
     max_unknown_duration_bytes: int = 100 * 1024 * 1024
+    diarization_mode: str = "auto"
+    diarization_model_dir: Path | None = None
+    # A known speaker count avoids threshold-based over-clustering on long,
+    # discontinuous recordings and is both faster and more predictable.
+    diarization_num_speakers: int = 2
+    diarization_cluster_threshold: float = 0.5
+    diarization_threads: int = 1
+    diarization_timeout_seconds: int = 14400
     summary_enabled: bool = True
     summary_model: str = "mistral"
     ollama_url: str = "http://127.0.0.1:11434"
@@ -176,9 +194,74 @@ class Config:
     def backups_dir(self) -> Path:
         return self.state_root / "Backups"
 
+    @property
+    def resolved_diarization_model_dir(self) -> Path:
+        return self.diarization_model_dir or self.state_root / "Models" / "Diarization"
+
+    @property
+    def diarization_segmentation_model(self) -> Path:
+        return (self.resolved_diarization_model_dir /
+                "sherpa-onnx-pyannote-segmentation-3-0" / "model.int8.onnx")
+
+    @property
+    def diarization_embedding_model(self) -> Path:
+        return self.resolved_diarization_model_dir / "nemo_en_titanet_small.onnx"
+
 
 def _expand_path(value: str | Path) -> Path:
     return Path(os.path.expandvars(os.path.expanduser(str(value)))).resolve()
+
+
+def discover_obsidian_vault(registry_path: Path | None = None) -> Path:
+    """Return the unambiguous active vault from Obsidian's local registry."""
+    registry = registry_path or OBSIDIAN_REGISTRY
+    try:
+        data = json.loads(registry.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise PipelineError(
+            f"Obsidian vault registry was not found at {registry}; "
+            "open Obsidian once or specify --vault"
+        ) from exc
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise PipelineError(f"Unable to read Obsidian vault registry {registry}: {exc}") from exc
+
+    vaults = data.get("vaults") if isinstance(data, dict) else None
+    if not isinstance(vaults, dict):
+        raise PipelineError(f"Obsidian vault registry has no valid vault list: {registry}")
+
+    available_by_path: dict[Path, bool] = {}
+    for entry in vaults.values():
+        if not isinstance(entry, dict) or not isinstance(entry.get("path"), str):
+            continue
+        raw_path = Path(os.path.expandvars(os.path.expanduser(entry["path"])))
+        if not raw_path.is_absolute():
+            continue
+        path = raw_path.resolve()
+        if path.is_dir() and (path / ".obsidian").is_dir():
+            available_by_path[path] = available_by_path.get(path, False) or entry.get("open") is True
+
+    available = list(available_by_path.items())
+    opened = [path for path, is_open in available if is_open]
+    if len(opened) == 1:
+        return opened[0]
+    if len(available) == 1:
+        return available[0][0]
+    if not available:
+        raise PipelineError(
+            "Obsidian has no locally available vault with a .obsidian directory; "
+            "open the vault or specify --vault"
+        )
+    choices = ", ".join(str(path) for path, _ in available)
+    raise PipelineError(
+        f"Obsidian vault selection is ambiguous ({choices}); "
+        "open one vault or specify --vault"
+    )
+
+
+def resolve_vault(cfg: Config, registry_path: Path | None = None) -> Path:
+    if cfg.vault_auto:
+        cfg.vault = discover_obsidian_vault(registry_path)
+    return cfg.vault
 
 
 def load_config(path: Path | None) -> Config:
@@ -217,6 +300,9 @@ def load_config(path: Path | None) -> Config:
             "hybrid_retry": "hybrid_retry", "confidence_threshold": "confidence_threshold",
             "language": "language", "initial_prompt": "initial_prompt",
             "word_timestamps": "word_timestamps", "vad_enabled": "vad_enabled",
+            "condition_on_previous_text": "condition_on_previous_text",
+            "compression_ratio_threshold": "compression_ratio_threshold",
+            "no_speech_threshold": "no_speech_threshold",
             "vad_noise_db": "vad_noise_db", "vad_min_silence_seconds": "vad_min_silence_seconds",
             "vad_padding_seconds": "vad_padding_seconds", "audio_filter": "audio_filter",
             "no_text_retry_model": "no_text_retry_model",
@@ -226,6 +312,12 @@ def load_config(path: Path | None) -> Config:
             "device": "device", "timeout_seconds": "transcription_timeout_seconds",
             "chunk_seconds": "chunk_seconds", "chunk_overlap_seconds": "chunk_overlap_seconds",
             "max_direct_seconds": "max_direct_seconds",
+        },
+        "diarization": {
+            "mode": "diarization_mode", "model_dir": "diarization_model_dir",
+            "num_speakers": "diarization_num_speakers",
+            "cluster_threshold": "diarization_cluster_threshold",
+            "threads": "diarization_threads", "timeout_seconds": "diarization_timeout_seconds",
         },
         "summarization": {
             "enabled": "summary_enabled", "model": "summary_model", "ollama_url": "ollama_url",
@@ -239,7 +331,7 @@ def load_config(path: Path | None) -> Config:
             "unmount_on_success": "unmount_on_success", "database_backups": "database_backups",
         },
     }
-    path_fields = {"mount_point", "vault", "state_root", "note_template"}
+    path_fields = {"mount_point", "vault", "state_root", "note_template", "diarization_model_dir"}
     for section, mapping in sections.items():
         values = data.get(section, {})
         if not isinstance(values, dict):
@@ -247,7 +339,12 @@ def load_config(path: Path | None) -> Config:
         for source, target in mapping.items():
             if source in values:
                 value = values[source]
+                if target == "vault" and isinstance(value, str) and value.strip().lower() == "auto":
+                    cfg.vault_auto = True
+                    continue
                 setattr(cfg, target, _expand_path(value) if target in path_fields else value)
+                if target == "vault":
+                    cfg.vault_auto = False
     corrections = data.get("corrections", {})
     if not isinstance(corrections, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in corrections.items()):
         raise PipelineError("[corrections] must contain string-to-string replacements")
@@ -259,10 +356,16 @@ def apply_overrides(cfg: Config, args: argparse.Namespace) -> Config:
     for arg, attr in (
         ("mount", "mount_point"), ("vault", "vault"), ("state_root", "state_root"),
         ("backend", "backend"), ("model", "model"), ("language", "language"),
+        ("diarization", "diarization_mode"),
     ):
         value = getattr(args, arg, None)
         if value is not None:
+            if attr == "vault" and str(value).strip().lower() == "auto":
+                cfg.vault_auto = True
+                continue
             setattr(cfg, attr, _expand_path(value) if attr in {"mount_point", "vault", "state_root"} else value)
+            if attr == "vault":
+                cfg.vault_auto = False
     if getattr(args, "no_summary", False):
         cfg.summary_enabled = False
     if getattr(args, "no_notify", False):
@@ -300,6 +403,14 @@ def ensure_private_directories(cfg: Config) -> None:
         raise PipelineError("transcription.no_text_retry_model cannot be empty")
     if cfg.min_active_audio_seconds < 0:
         raise PipelineError("transcription.min_active_audio_seconds cannot be negative")
+    if cfg.diarization_mode not in {"auto", "on", "off"}:
+        raise PipelineError("diarization.mode must be 'auto', 'on', or 'off'")
+    if cfg.diarization_num_speakers == 0 or cfg.diarization_num_speakers < -1:
+        raise PipelineError("diarization.num_speakers must be -1 or a positive integer")
+    if not 0 < cfg.diarization_cluster_threshold <= 1:
+        raise PipelineError("diarization.cluster_threshold must be greater than 0 and at most 1")
+    if cfg.diarization_threads < 1 or cfg.diarization_timeout_seconds <= 0:
+        raise PipelineError("diarization threads and timeout must be positive")
     if not isinstance(cfg.nice_level, int) or not 0 <= cfg.nice_level <= 20:
         raise PipelineError("behavior.nice_level must be an integer from 0 through 20")
     if cfg.ollama_start_timeout_seconds <= 0:
@@ -307,7 +418,8 @@ def ensure_private_directories(cfg: Config) -> None:
     old_umask = os.umask(0o077)
     try:
         for path in (cfg.state_root, cfg.incoming_dir, cfg.processing_dir, cfg.archive_dir, cfg.failed_dir,
-                     cfg.transcripts_dir, cfg.summaries_dir, cfg.chunks_dir, cfg.backups_dir):
+                     cfg.transcripts_dir, cfg.summaries_dir, cfg.chunks_dir, cfg.backups_dir,
+                     cfg.resolved_diarization_model_dir):
             path.mkdir(parents=True, exist_ok=True, mode=0o700)
         cfg.notes_folder.mkdir(parents=True, exist_ok=True)
     finally:
@@ -428,7 +540,7 @@ class PipelineLock:
                     continue
                 except PermissionError:
                     pass
-                raise PipelineError(f"Another pipeline process is already running (PID {pid})")
+                raise PipelineBusyError(f"Another pipeline process is already running (PID {pid})")
         raise PipelineError(f"Unable to acquire pipeline lock: {self.path}")
 
     def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
@@ -491,6 +603,8 @@ class StateDB:
                 transcript_path TEXT,
                 cleaned_transcript_path TEXT,
                 segments_path TEXT,
+                speaker_transcript_path TEXT,
+                diarization_segments_path TEXT,
                 summary_path TEXT,
                 note_path TEXT,
                 detected_language TEXT,
@@ -511,6 +625,8 @@ class StateDB:
                 audio_clipping_percent REAL,
                 audio_quality_json TEXT,
                 transcribe_seconds REAL,
+                diarize_seconds REAL,
+                diarization_model TEXT,
                 summary_seconds REAL,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
@@ -561,6 +677,10 @@ class StateDB:
             "audio_active_seconds": "REAL",
             "audio_clipping_percent": "REAL",
             "audio_quality_json": "TEXT",
+            "speaker_transcript_path": "TEXT",
+            "diarization_segments_path": "TEXT",
+            "diarize_seconds": "REAL",
+            "diarization_model": "TEXT",
         }
         for name, declaration in additions.items():
             if name not in columns:
@@ -692,7 +812,7 @@ class StateDB:
     def find_duplicate(self, digest: str, exclude_id: int) -> sqlite3.Row | None:
         return self.conn.execute(
             """SELECT * FROM recordings
-               WHERE sha256=? AND id<>? AND status IN ('ready','transcribing','transcribed','summarizing','summarized','writing','completed','duplicate')
+               WHERE sha256=? AND id<>? AND status IN ('ready','transcribing','transcribed','diarizing','summarizing','summarized','writing','completed','duplicate')
                ORDER BY CASE status WHEN 'completed' THEN 0 WHEN 'duplicate' THEN 1 ELSE 2 END, id LIMIT 1""",
             (digest, exclude_id),
         ).fetchone()
@@ -1274,6 +1394,45 @@ def normalize_result(result: dict[str, Any]) -> dict[str, Any]:
     return {"text": str(result.get("text", "")).strip(), "language": result.get("language"), "segments": segments}
 
 
+def text_compression_ratio(text: str) -> float:
+    """Return Whisper's gzip-like repetition signal for text."""
+    data = text.encode("utf-8")
+    return len(data) / max(1, len(zlib.compress(data)))
+
+
+def remove_repetition_hallucinations(
+    result: dict[str, Any], compression_threshold: float, no_speech_threshold: float,
+    logger: logging.Logger | None = None,
+) -> dict[str, Any]:
+    """Remove segments that remain repetition loops after decoder fallback."""
+    normalized = normalize_result(result)
+    kept: list[dict[str, Any]] = []
+    removed = 0
+    probable_silence = 0
+    for segment in normalized["segments"]:
+        text = str(segment.get("text", ""))
+        ratio_value = segment.get("compression_ratio")
+        ratio = float(ratio_value) if ratio_value is not None else text_compression_ratio(text)
+        if ratio > compression_threshold:
+            removed += 1
+            no_speech = segment.get("no_speech_prob")
+            probable_silence += int(no_speech is not None and float(no_speech) >= no_speech_threshold)
+            continue
+        kept.append(segment)
+    if not removed:
+        return normalized
+    if logger:
+        logger.warning(
+            "Removed %d unresolved repetitive hallucination segment(s) after decoder fallback (%d in probable silence)",
+            removed, probable_silence,
+        )
+    return {
+        "text": "".join(str(segment["text"]) for segment in kept).strip(),
+        "language": normalized.get("language"),
+        "segments": kept,
+    }
+
+
 def mlx_worker_main(request_path: Path, response_path: Path) -> int:
     """Run one MLX inference job in an expendable process."""
     request = json.loads(request_path.read_text(encoding="utf-8"))
@@ -1283,7 +1442,12 @@ def mlx_worker_main(request_path: Path, response_path: Path) -> int:
         hallucination_silence_threshold=1.5 if request["word_timestamps"] else None,
         language=request["language"], initial_prompt=request["initial_prompt"],
         word_timestamps=request["word_timestamps"], clip_timestamps=request["clip_timestamps"],
-        no_speech_threshold=0.6, condition_on_previous_text=True,
+        # MLX can cancel compression fallback when no_speech is high. Keep that
+        # fast silence path, then reject any high-compression output in our
+        # process so the cancelled fallback can never leak a repetition loop.
+        no_speech_threshold=request.get("no_speech_threshold", 0.6),
+        compression_ratio_threshold=request["compression_ratio_threshold"],
+        condition_on_previous_text=request["condition_on_previous_text"],
     )
     normalized = normalize_result(result)
     atomic_write(response_path, json.dumps(normalized, ensure_ascii=False) + "\n")
@@ -1291,9 +1455,12 @@ def mlx_worker_main(request_path: Path, response_path: Path) -> int:
 
 
 class Transcriber:
-    def __init__(self, cfg: Config, logger: logging.Logger):
+    def __init__(
+        self, cfg: Config, logger: logging.Logger, *, force_word_timestamps: bool = False,
+    ):
         self.cfg = cfg
         self.logger = logger
+        self.word_timestamps = cfg.word_timestamps or force_word_timestamps
         self.backend = self._select_backend(cfg.backend)
         self._mock_calls = 0
 
@@ -1355,6 +1522,9 @@ class Transcriber:
                 "initial_prompt": common["initial_prompt"],
                 "word_timestamps": common["word_timestamps"],
                 "clip_timestamps": common["clip_timestamps"],
+                "compression_ratio_threshold": common["compression_ratio_threshold"],
+                "no_speech_threshold": common["no_speech_threshold"],
+                "condition_on_previous_text": common["condition_on_previous_text"],
             }, ensure_ascii=False) + "\n")
             command = [sys.executable, str(Path(__file__).resolve()), "_mlx-worker", str(request_path), str(response_path)]
             try:
@@ -1385,10 +1555,11 @@ class Transcriber:
         common: dict[str, Any] = {
             "language": self.cfg.language or None,
             "initial_prompt": self.cfg.initial_prompt or None,
-            "word_timestamps": self.cfg.word_timestamps,
+            "word_timestamps": self.word_timestamps,
             "clip_timestamps": clip_value,
-            "no_speech_threshold": 0.6,
-            "condition_on_previous_text": True,
+            "no_speech_threshold": self.cfg.no_speech_threshold,
+            "compression_ratio_threshold": self.cfg.compression_ratio_threshold,
+            "condition_on_previous_text": self.cfg.condition_on_previous_text,
         }
         if self.backend == "mlx":
             result = self._transcribe_mlx_worker(path, model, common)
@@ -1414,8 +1585,11 @@ class Transcriber:
                 command = [
                     "whisper", str(path), "--model", self.openai_model_name(model),
                     "--output_format", "json", "--output_dir", directory, "--verbose", "False",
-                    "--word_timestamps", str(self.cfg.word_timestamps),
+                    "--word_timestamps", str(self.word_timestamps),
                     "--clip_timestamps", ",".join(str(v) for v in clips) if clips else "0",
+                    "--condition_on_previous_text", str(self.cfg.condition_on_previous_text),
+                    "--compression_ratio_threshold", str(self.cfg.compression_ratio_threshold),
+                    "--no_speech_threshold", str(self.cfg.no_speech_threshold),
                 ]
                 if self.cfg.language:
                     command += ["--language", self.cfg.language]
@@ -1437,7 +1611,10 @@ class Transcriber:
             raise PipelineError("No transcription backend is available. Install mlx-whisper or openai-whisper.")
         if self.backend == "openai":
             self._loaded_model_name = target_model
-        return normalize_result(result)
+        return remove_repetition_hallucinations(
+            result, self.cfg.compression_ratio_threshold,
+            self.cfg.no_speech_threshold, self.logger,
+        )
 
     def version(self) -> str:
         try:
@@ -1708,6 +1885,269 @@ def timestamped_text(result: dict[str, Any]) -> str:
     return "\n".join(f"[{format_timestamp(float(segment['start']))}] {str(segment['text']).strip()}" for segment in result["segments"])
 
 
+def diarization_missing(cfg: Config) -> list[str]:
+    missing: list[str] = []
+    try:
+        import sherpa_onnx  # noqa: F401
+    except ImportError:
+        missing.append("Python package sherpa-onnx")
+    for path in (cfg.diarization_segmentation_model, cfg.diarization_embedding_model):
+        if not path.is_file():
+            missing.append(str(path))
+    return missing
+
+
+def diarization_enabled(cfg: Config, logger: logging.Logger | None = None) -> bool:
+    if cfg.diarization_mode == "off":
+        return False
+    missing = diarization_missing(cfg)
+    if not missing:
+        return True
+    message = "Speaker diarization is unavailable; missing: " + ", ".join(missing)
+    if cfg.diarization_mode == "on":
+        raise PipelineError(message)
+    if logger:
+        logger.debug(message)
+    return False
+
+
+def diarization_worker_main(request_path: Path, response_path: Path) -> int:
+    """Run CPU-only Sherpa-ONNX diarization in an expendable process."""
+    request = json.loads(request_path.read_text(encoding="utf-8"))
+    import numpy as np
+    import sherpa_onnx
+
+    with tempfile.TemporaryDirectory(prefix="diarization-audio-", dir=request["temp_dir"]) as directory:
+        samples_path = Path(directory) / "samples.f32"
+        intervals = request.get("intervals") or []
+        with samples_path.open("wb") as samples_file:
+            sources = intervals or [[None, None]]
+            for index, (start, end) in enumerate(sources):
+                command = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin"]
+                if start is not None:
+                    command += ["-ss", f"{float(start):.3f}"]
+                command += ["-i", request["audio_path"]]
+                if start is not None and end is not None:
+                    command += ["-t", f"{float(end) - float(start):.3f}"]
+                command += ["-ar", "16000", "-ac", "1", "-f", "f32le", "-c:a", "pcm_f32le", "-"]
+                process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                assert process.stdout is not None and process.stderr is not None
+                shutil.copyfileobj(process.stdout, samples_file, length=1024 * 1024)
+                stderr = process.stderr.read().decode("utf-8", errors="replace")
+                returncode = process.wait()
+                if returncode != 0:
+                    raise PipelineError(f"Diarization audio decoding failed: {stderr.strip()[-2000:]}")
+                if intervals and index + 1 < len(sources):
+                    # Prevent two unrelated retained regions from becoming an
+                    # artificial continuous utterance after compaction.
+                    samples_file.write(b"\0" * (16_000 * 4))
+        samples = np.memmap(samples_path, dtype=np.float32, mode="r")
+        config = sherpa_onnx.OfflineSpeakerDiarizationConfig(
+            segmentation=sherpa_onnx.OfflineSpeakerSegmentationModelConfig(
+                pyannote=sherpa_onnx.OfflineSpeakerSegmentationPyannoteModelConfig(
+                    model=request["segmentation_model"],
+                ),
+                num_threads=request["threads"], provider="cpu",
+            ),
+            embedding=sherpa_onnx.SpeakerEmbeddingExtractorConfig(
+                model=request["embedding_model"],
+                num_threads=request["threads"], provider="cpu",
+            ),
+            clustering=sherpa_onnx.FastClusteringConfig(
+                num_clusters=request["num_speakers"],
+                threshold=request["cluster_threshold"],
+            ),
+            min_duration_on=0.3,
+            min_duration_off=0.5,
+        )
+        if not config.validate():
+            raise PipelineError("Sherpa-ONNX rejected the diarization model configuration")
+        diarizer = sherpa_onnx.OfflineSpeakerDiarization(config)
+        segments = diarizer.process(samples).sort_by_start_time()
+        payload = [
+            {"start": float(item.start), "end": float(item.end), "speaker": int(item.speaker)}
+            for item in segments
+        ]
+        atomic_write(response_path, json.dumps(payload, ensure_ascii=False) + "\n")
+    return 0
+
+
+class Diarizer:
+    MODEL_NAME = "sherpa-onnx pyannote-3.0-int8 + NeMo TitaNet-small"
+
+    def __init__(self, cfg: Config, logger: logging.Logger):
+        self.cfg = cfg
+        self.logger = logger
+
+    @staticmethod
+    def speech_intervals(result: dict[str, Any], duration: float | None) -> list[list[float]]:
+        intervals: list[list[float]] = []
+        for segment in normalize_result(result)["segments"]:
+            start = max(0.0, float(segment["start"]) - 0.5)
+            end = float(segment["end"]) + 0.5
+            if duration is not None:
+                end = min(duration, end)
+            if intervals and start <= intervals[-1][1] + 5.0:
+                intervals[-1][1] = max(intervals[-1][1], end)
+            else:
+                intervals.append([start, end])
+        return intervals
+
+    @staticmethod
+    def restore_timestamps(
+        spans: Sequence[dict[str, Any]], intervals: Sequence[Sequence[float]],
+    ) -> list[dict[str, Any]]:
+        if not intervals:
+            return list(spans)
+        mapping: list[tuple[float, float, float]] = []
+        compact_start = 0.0
+        for start, end in intervals:
+            compact_end = compact_start + float(end) - float(start)
+            mapping.append((compact_start, compact_end, float(start)))
+            compact_start = compact_end + 1.0
+        restored: list[dict[str, Any]] = []
+        for span in spans:
+            for compact_begin, compact_end, original_begin in mapping:
+                begin = max(float(span["start"]), compact_begin)
+                end = min(float(span["end"]), compact_end)
+                if end <= begin:
+                    continue
+                restored.append({
+                    "start": original_begin + begin - compact_begin,
+                    "end": original_begin + end - compact_begin,
+                    "speaker": int(span["speaker"]),
+                })
+        return restored
+
+    def diarize(
+        self, audio_path: Path, transcript_result: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        missing = diarization_missing(self.cfg)
+        if missing:
+            raise PipelineError("Speaker diarization is unavailable; missing: " + ", ".join(missing))
+        duration = ffprobe_duration(audio_path)
+        intervals = self.speech_intervals(transcript_result, duration) if transcript_result else []
+        selected_seconds = sum(end - start for start, end in intervals) if intervals else duration
+        if duration and intervals and selected_seconds < duration * 0.9:
+            self.logger.info(
+                "Diarizing %.2f hours of retained speech instead of %.2f hours of source audio",
+                selected_seconds / 3600, duration / 3600,
+            )
+        else:
+            intervals = []
+        if selected_seconds:
+            required = int(selected_seconds * 16_000 * 4) + 100 * 1024 * 1024
+            if shutil.disk_usage(self.cfg.chunks_dir).free < required:
+                raise PipelineError("Not enough free space for memory-safe diarization audio")
+        with tempfile.TemporaryDirectory(prefix="diarization-worker-", dir=self.cfg.chunks_dir) as directory:
+            worker_dir = Path(directory)
+            request_path = worker_dir / "request.json"
+            response_path = worker_dir / "response.json"
+            atomic_write(request_path, json.dumps({
+                "audio_path": str(audio_path),
+                "segmentation_model": str(self.cfg.diarization_segmentation_model),
+                "embedding_model": str(self.cfg.diarization_embedding_model),
+                "num_speakers": self.cfg.diarization_num_speakers,
+                "cluster_threshold": self.cfg.diarization_cluster_threshold,
+                "threads": self.cfg.diarization_threads,
+                "temp_dir": str(self.cfg.chunks_dir),
+                "intervals": intervals,
+            }) + "\n")
+            command = [
+                sys.executable, str(Path(__file__).resolve()),
+                "_diarization-worker", str(request_path), str(response_path),
+            ]
+            try:
+                completed = subprocess.run(
+                    command, text=True, capture_output=True, check=False,
+                    timeout=self.cfg.diarization_timeout_seconds,
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise PipelineError(f"Speaker diarization timed out for {audio_path.name}") from exc
+            if completed.returncode != 0:
+                detail = (completed.stderr or completed.stdout).strip()[-3000:]
+                reason = detail or f"worker exit code {completed.returncode}"
+                raise PipelineError(f"Speaker diarization failed: {reason}")
+            try:
+                data = json.loads(response_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise PipelineError("Speaker diarization returned an invalid result") from exc
+            if not isinstance(data, list):
+                raise PipelineError("Speaker diarization returned an invalid result")
+            return self.restore_timestamps(data, intervals)
+
+
+def _join_whisper_tokens(tokens: Sequence[str]) -> str:
+    text = ""
+    for token in tokens:
+        if not token:
+            continue
+        if text and not token[:1].isspace() and token[:1] not in ",.!?;:)]}":
+            text += " "
+        text += token
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def speaker_transcript(
+    result: dict[str, Any], diarization: Sequence[dict[str, Any]],
+    corrections: dict[str, str],
+) -> tuple[str, list[dict[str, Any]]]:
+    """Assign Whisper words to diarization spans and format readable turns."""
+    units: list[dict[str, Any]] = []
+    for segment in normalize_result(result)["segments"]:
+        words = segment.get("words") or []
+        if words:
+            for word in words:
+                units.append({
+                    "start": float(word.get("start", segment["start"])),
+                    "end": float(word.get("end", segment["end"])),
+                    "text": str(word.get("word", word.get("text", ""))),
+                })
+        elif str(segment.get("text", "")).strip():
+            units.append({
+                "start": float(segment["start"]), "end": float(segment["end"]),
+                "text": str(segment["text"]),
+            })
+    if not units or not diarization:
+        return apply_corrections(str(result.get("text", "")).strip(), corrections), []
+
+    def choose_speaker(unit: dict[str, Any]) -> int:
+        start, end = unit["start"], unit["end"]
+        midpoint = (start + end) / 2
+        scored = []
+        for span in diarization:
+            overlap = max(0.0, min(end, float(span["end"])) - max(start, float(span["start"])))
+            distance = abs(midpoint - (float(span["start"]) + float(span["end"])) / 2)
+            scored.append((overlap, -distance, int(span["speaker"])))
+        return max(scored)[2]
+
+    raw_turns: list[dict[str, Any]] = []
+    for unit in units:
+        speaker = choose_speaker(unit)
+        if raw_turns and raw_turns[-1]["speaker"] == speaker:
+            raw_turns[-1]["end"] = unit["end"]
+            raw_turns[-1]["tokens"].append(unit["text"])
+        else:
+            raw_turns.append({
+                "speaker": speaker, "start": unit["start"], "end": unit["end"],
+                "tokens": [unit["text"]],
+            })
+
+    labels: dict[int, int] = {}
+    turns: list[dict[str, Any]] = []
+    for item in raw_turns:
+        raw_speaker = int(item["speaker"])
+        labels.setdefault(raw_speaker, len(labels) + 1)
+        text = apply_corrections(_join_whisper_tokens(item["tokens"]), corrections)
+        if text:
+            turns.append({
+                "speaker": labels[raw_speaker], "start": item["start"],
+                "end": item["end"], "text": text,
+            })
+    formatted = "\n\n".join(f"Person {item['speaker']}: {item['text']}" for item in turns)
+    return formatted, turns
+
+
 DEFAULT_NOTE_TEMPLATE_PATH = Path(__file__).with_name("default-note-template.txt")
 try:
     DEFAULT_NOTE_TEMPLATE = DEFAULT_NOTE_TEMPLATE_PATH.read_text(encoding="utf-8")
@@ -1773,6 +2213,7 @@ class Pipeline:
         self.transcriber: Transcriber | None = None
         self.summarizer = OllamaSummarizer(cfg, logger)
         self._ollama_preflight_done = False
+        self._diarization_active: bool | None = None
 
     def _ensure_ollama_preflight(self) -> None:
         if self._ollama_preflight_done:
@@ -1782,9 +2223,22 @@ class Pipeline:
 
     def _ensure_transcriber(self) -> Transcriber:
         if self.transcriber is None:
-            self.transcriber = Transcriber(self.cfg, self.logger)
+            self.transcriber = Transcriber(
+                self.cfg, self.logger,
+                force_word_timestamps=self._use_diarization(),
+            )
             self.logger.info("Transcription backend: %s", self.transcriber.backend)
         return self.transcriber
+
+    def _use_diarization(self) -> bool:
+        if self._diarization_active is None:
+            self._diarization_active = diarization_enabled(self.cfg, self.logger)
+            if self._diarization_active:
+                self.logger.info("Speaker diarization: enabled (%s)", Diarizer.MODEL_NAME)
+            elif self.cfg.diarization_mode == "auto":
+                self.logger.info("Speaker diarization: waiting for models in %s",
+                                 self.cfg.resolved_diarization_model_dir)
+        return self._diarization_active
 
     def _release_transcriber(self) -> None:
         if self.transcriber is None:
@@ -1858,7 +2312,10 @@ class Pipeline:
             "confidence_threshold": self.cfg.confidence_threshold,
             "language": self.cfg.language,
             "initial_prompt": self.cfg.initial_prompt,
-            "word_timestamps": self.cfg.word_timestamps,
+            "word_timestamps": self.cfg.word_timestamps or self._use_diarization(),
+            "condition_on_previous_text": self.cfg.condition_on_previous_text,
+            "compression_ratio_threshold": self.cfg.compression_ratio_threshold,
+            "no_speech_threshold": self.cfg.no_speech_threshold,
             "vad_enabled": self.cfg.vad_enabled,
             "vad_noise_db": self.cfg.vad_noise_db,
             "vad_min_silence_seconds": self.cfg.vad_min_silence_seconds,
@@ -1982,6 +2439,7 @@ class Pipeline:
 
     def _summarize_result(
         self, record_id: int, row: sqlite3.Row, result: dict[str, Any], digest: str,
+        transcript: str | None = None,
     ) -> str:
         summary_path = Path(row["summary_path"]) if row["summary_path"] else self.cfg.summaries_dir / f"{digest}.md"
         if not self.cfg.summary_enabled:
@@ -1993,7 +2451,7 @@ class Pipeline:
         self.logger.info("Summarizing: %s", row["source_name"])
         started = time.monotonic()
         summary = self.summarizer.summarize(
-            timestamped_text(corrected_result(result, self.cfg.corrections))
+            transcript or timestamped_text(corrected_result(result, self.cfg.corrections))
         )
         elapsed = time.monotonic() - started
         atomic_write(summary_path, summary.strip() + "\n")
@@ -2090,6 +2548,8 @@ class Pipeline:
             transcript_path = Path(row["transcript_path"]) if row["transcript_path"] else self.cfg.transcripts_dir / f"{digest}.raw.txt"
             cleaned_path = Path(row["cleaned_transcript_path"]) if row["cleaned_transcript_path"] else self.cfg.transcripts_dir / f"{digest}.clean.txt"
             segments_path = Path(row["segments_path"]) if row["segments_path"] else self.cfg.transcripts_dir / f"{digest}.segments.json"
+            speaker_path = Path(row["speaker_transcript_path"]) if row["speaker_transcript_path"] else self.cfg.transcripts_dir / f"{digest}.speakers.txt"
+            diarization_path = Path(row["diarization_segments_path"]) if row["diarization_segments_path"] else self.cfg.transcripts_dir / f"{digest}.speakers.json"
             if not transcript_path.exists() or not segments_path.exists():
                 self.db.increment_attempt(record_id)
                 self.db.update(record_id, status="transcribing", failed_stage=None, last_error=None,
@@ -2149,19 +2609,47 @@ class Pipeline:
                 raw = transcript_path.read_text(encoding="utf-8").strip()
                 cleaned = cleaned_path.read_text(encoding="utf-8").strip() if cleaned_path.exists() else apply_corrections(raw, self.cfg.corrections)
 
-            # Whisper and Ollama must never retain their large models at the same time.
+            # Whisper, diarization, and Ollama models never coexist in memory.
             self._release_transcriber()
+            display_transcript = cleaned
+            if self._use_diarization():
+                stage = "diarization"
+                if not speaker_path.exists() or not diarization_path.exists():
+                    self.db.update(record_id, status="diarizing", failed_stage=None, last_error=None)
+                    self.logger.info("Identifying speakers: %s", row["source_name"])
+                    started = time.monotonic()
+                    spans = Diarizer(self.cfg, self.logger).diarize(audio_path, result)
+                    display_transcript, turns = speaker_transcript(result, spans, self.cfg.corrections)
+                    atomic_write(speaker_path, display_transcript.strip() + "\n")
+                    atomic_write(diarization_path, json.dumps({
+                        "model": Diarizer.MODEL_NAME,
+                        "spans": spans,
+                        "turns": turns,
+                    }, ensure_ascii=False, indent=2) + "\n")
+                    elapsed = time.monotonic() - started
+                    self.db.update(
+                        record_id, status="transcribed",
+                        speaker_transcript_path=str(speaker_path),
+                        diarization_segments_path=str(diarization_path),
+                        diarization_model=Diarizer.MODEL_NAME,
+                        diarize_seconds=elapsed,
+                    )
+                    self.logger.info("Speakers identified in %.1fs", elapsed)
+                else:
+                    display_transcript = speaker_path.read_text(encoding="utf-8").strip()
+
             stage = "summary"
+            row = self.db.get(record_id)
             summary_path = Path(row["summary_path"]) if row["summary_path"] else self.cfg.summaries_dir / f"{digest}.md"
             summary_model_touched = self.cfg.summary_enabled and not summary_path.exists()
-            summary = self._summarize_result(record_id, row, result, digest)
+            summary = self._summarize_result(record_id, row, result, digest, display_transcript)
             row = self.db.get(record_id)
             stage = "note"
             self.db.update(record_id, status="writing", failed_stage=None, last_error=None)
             summary_model_touched |= bool(
                 self.cfg.generate_title and not row["generated_title"] and self.cfg.summary_enabled
             )
-            self._write_note_and_finalize(record_id, row, audio_path, digest, summary, cleaned)
+            self._write_note_and_finalize(record_id, row, audio_path, digest, summary, display_transcript)
             return "completed"
         except Exception as exc:
             failed_audio = audio_path
@@ -2308,6 +2796,15 @@ def check_dependencies(cfg: Config, logger: logging.Logger) -> bool:
         except Exception as exc:
             logger.error("Ollama: unavailable (%s)", exc)
             ok = False
+    diarization_problems = diarization_missing(cfg)
+    if cfg.diarization_mode == "off":
+        logger.info("Diarization: disabled")
+    elif diarization_problems:
+        level = logger.error if cfg.diarization_mode == "on" else logger.info
+        level("Diarization: inactive; missing %s", ", ".join(diarization_problems))
+        ok &= cfg.diarization_mode != "on"
+    else:
+        logger.info("Diarization: ready (%s)", Diarizer.MODEL_NAME)
     recorder_ready = cfg.recorder_folder.is_dir() and os.access(cfg.recorder_folder, os.R_OK)
     logger.info("Recorder:    %s (%s)", cfg.recorder_folder, "readable" if recorder_ready else "not mounted")
     for label, path in (("Vault", cfg.vault), ("State", cfg.state_root)):
@@ -2370,6 +2867,15 @@ def doctor(cfg: Config, db: StateDB, logger: logging.Logger) -> bool:
 def prepare_dependencies(cfg: Config, logger: logging.Logger) -> None:
     transcriber = Transcriber(cfg, logger)
     transcriber.prepare_models()
+    if cfg.diarization_mode != "off":
+        problems = diarization_missing(cfg)
+        if problems:
+            message = "Diarization models are not installed: " + ", ".join(problems)
+            if cfg.diarization_mode == "on":
+                raise PipelineError(message)
+            logger.info(message)
+        else:
+            logger.info("Diarization models are ready")
     if cfg.summary_enabled and cfg.summary_model != "mock":
         ensure_ollama_running(cfg, logger)
         try:
@@ -2424,7 +2930,7 @@ def ignore_known_macos_metadata(db: StateDB, logger: logging.Logger) -> int:
 def recover_interrupted(db: StateDB, cfg: Config, logger: logging.Logger) -> int:
     """Return records left in an in-progress state to their last durable stage."""
     rows = list(db.conn.execute(
-        "SELECT * FROM recordings WHERE status IN ('copying','transcribing','summarizing','writing')"
+        "SELECT * FROM recordings WHERE status IN ('copying','transcribing','diarizing','summarizing','writing')"
     ))
     for row in rows:
         if row["status"] == "copying":
@@ -2451,8 +2957,22 @@ def reset_for_reprocess(db: StateDB, hash_prefix: str, logger: logging.Logger) -
     row = db.by_hash_prefix(hash_prefix)
     if not row["local_path"] or not Path(row["local_path"]).exists():
         raise PipelineError("Cannot reprocess because the local audio file is missing")
+    # These files are reproducible application state. Removing the exact paths
+    # recorded in the database makes reprocess actually run the new decoder;
+    # the existing Obsidian note is deliberately preserved.
+    for field in (
+        "transcript_path", "cleaned_transcript_path", "segments_path",
+        "speaker_transcript_path", "diarization_segments_path", "summary_path",
+    ):
+        value = row[field]
+        if value:
+            path = Path(value)
+            if path.is_file():
+                path.unlink()
     db.update(int(row["id"]), status="ready", failed_stage=None, last_error=None,
               transcript_path=None, cleaned_transcript_path=None, segments_path=None,
+              speaker_transcript_path=None, diarization_segments_path=None,
+              diarize_seconds=None, diarization_model=None,
               summary_path=None, note_path=None, completed_at=None,
               no_text_retries=0, next_retry_at=None, consecutive_failures=0,
               transcription_generation=int(row["transcription_generation"] or 0) + 1)
@@ -2564,7 +3084,8 @@ def maintain_state(
     referenced = {
         str(Path(value).resolve())
         for row in db.conn.execute(
-            "SELECT transcript_path,cleaned_transcript_path,segments_path,summary_path FROM recordings"
+            "SELECT transcript_path,cleaned_transcript_path,segments_path,speaker_transcript_path,"
+            "diarization_segments_path,summary_path FROM recordings"
         )
         for value in row if value
     }
@@ -2707,7 +3228,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=APP_VERSION)
     parser.add_argument("--config", type=Path, help="TOML configuration file")
     parser.add_argument("--mount", help="Recorder mount point")
-    parser.add_argument("--vault", help="Obsidian vault path")
+    parser.add_argument("--vault", help="Obsidian vault path, or 'auto' to discover the active vault")
     parser.add_argument("--state-root", help="Local pipeline state directory")
     parser.add_argument(
         "--reset-state", action="store_true",
@@ -2724,6 +3245,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--backend", choices=("auto", "mlx", "openai", "cli", "mock"))
     parser.add_argument("--model")
     parser.add_argument("--language", help="Known language code; use 'auto' to detect")
+    parser.add_argument(
+        "--diarization", choices=("auto", "on", "off"),
+        help="speaker labeling mode (default: auto when local models exist)",
+    )
     parser.add_argument("--maximum-accuracy", action="store_true", help="Use large-v3 for all audio")
     parser.add_argument("--no-summary", action="store_true")
     parser.add_argument("--no-vad", action="store_true")
@@ -2888,6 +3413,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     cfg: Config | None = None
     try:
         cfg = apply_overrides(load_config(args.config), args)
+        resolve_vault(cfg)
         if args.reset_state:
             target = cfg.state_root.resolve()
             removed = reset_application_state(cfg)
@@ -2971,6 +3497,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                     maintain_state(cfg, db, logger, args.dry_run, args.prune_model_cache)
                     return 0
         parser.error(f"Unhandled command: {args.command}")
+    except PipelineBusyError as exc:
+        # LaunchAgent mount polls commonly overlap a long manual run. That is a
+        # healthy no-op, not an error worth waking the user about.
+        logging.getLogger(APP_NAME).info("%s", exc)
+        return 0
     except PipelineError as exc:
         logging.getLogger(APP_NAME).error("Error: %s", exc)
         notify_error(str(exc), cfg or Config())
@@ -2984,4 +3515,6 @@ def main(argv: Sequence[str] | None = None) -> int:
 if __name__ == "__main__":
     if len(sys.argv) == 4 and sys.argv[1] == "_mlx-worker":
         raise SystemExit(mlx_worker_main(Path(sys.argv[2]), Path(sys.argv[3])))
+    if len(sys.argv) == 4 and sys.argv[1] == "_diarization-worker":
+        raise SystemExit(diarization_worker_main(Path(sys.argv[2]), Path(sys.argv[3])))
     raise SystemExit(main())

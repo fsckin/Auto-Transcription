@@ -692,6 +692,12 @@ scipy==1.18.0 \
     --hash=sha256:f2a6af57bd9e4a75d70e4117e78a1bbee84f79ae3fbb6d0111005d6ebcc4cb8d \
     --hash=sha256:f351e0dd702687d12a402b867a1b4146a256923e1c38317cbc472f6372b94707
     # via mlx-whisper
+sherpa-onnx==1.13.4 \
+    --hash=sha256:ff38ac153527fda0f6158e7c097b66e980a6840455d908e037ce09a4a4c1ce14
+    # via -r requirements-apple-silicon.txt
+sherpa-onnx-core==1.13.4 \
+    --hash=sha256:7820183581b711a68e30281a4fb36c0af8ef5615bfc789234fb259439824a014
+    # via sherpa-onnx
 sympy==1.14.0 \
     --hash=sha256:d3d3fe8df1e5a0b42f0e7bdf50541697dbe7d23746e894990c030e2b05e72517 \
     --hash=sha256:e091cc3e99d2141a0ba2847328f5479b05d94a6635cb96148ccb3f34671bd8f5
