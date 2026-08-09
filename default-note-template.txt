@@ -6,6 +6,11 @@ original_file: {{original_file}}
 original_path: {{original_path}}
 file_hash: {{file_hash}}
 audio_duration_seconds: {{duration_seconds}}
+audio_mean_db: {{audio_mean_db}}
+audio_peak_db: {{audio_peak_db}}
+audio_active_seconds: {{audio_active_seconds}}
+audio_clipping_percent: {{audio_clipping_percent}}
+audio_quality_warnings: {{audio_quality_warnings}}
 language: {{language}}
 transcription_backend: {{backend}}
 transcription_model: {{model}}

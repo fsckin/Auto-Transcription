@@ -16,7 +16,9 @@ import math
 import os
 from pathlib import Path
 import platform
+import plistlib
 import re
+import resource
 import shutil
 import signal
 import sqlite3
@@ -24,26 +26,29 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import Any, Iterable, Iterator, Sequence
+import tomllib
+from typing import Any, Iterator, Sequence
 import urllib.error
 import urllib.parse
 import urllib.request
 
-try:
-    import tomllib
-except ModuleNotFoundError:  # pragma: no cover - Python 3.10 fallback
-    tomllib = None
-
 
 APP_NAME = "auto-transcription"
-APP_VERSION = "2.1.1"
+APP_VERSION = "3.0.1"
+DB_SCHEMA_VERSION = 3
 AUDIO_SUFFIXES = {".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg"}
-FINAL_STATES = {"completed", "duplicate"}
-ACTIVE_STATES = {"detected", "copying", "ready", "transcribing", "transcribed", "summarizing", "summarized", "writing"}
+FINAL_STATES = {"completed", "duplicate", "ignored", "no_speech", "needs_review"}
+LAUNCHD_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+APPLE_METADATA_MAGICS = {b"\x00\x05\x16\x00", b"\x00\x05\x16\x07"}
+APPLE_METADATA_VERSIONS = {b"\x00\x01\x00\x00", b"\x00\x02\x00\x00"}
 
 
 class PipelineError(RuntimeError):
     """An expected, user-actionable pipeline failure."""
+
+
+class NeedsReviewError(PipelineError):
+    """A terminal transcription failure that should not be retried automatically."""
 
 
 @dataclasses.dataclass
@@ -59,8 +64,13 @@ class Config:
     note_template: Path | None = None
     generate_title: bool = False
     stable_wait_seconds: float = 1.0
+    stable_check_count: int = 3
+    readiness_probe_seconds: float = 1.0
     import_retry_count: int = 2
     copy_timeout_seconds: int = 1800
+    retry_base_seconds: int = 300
+    retry_max_seconds: int = 21600
+    recorder_volume_uuid: str = ""
     backend: str = "auto"
     # The small model is the default memory-safe balance for a 16 GB Mac.
     # Larger models remain available through configuration or --maximum-accuracy.
@@ -76,6 +86,12 @@ class Config:
     vad_min_silence_seconds: float = 1.0
     vad_padding_seconds: float = 0.25
     audio_filter: str = ""
+    no_text_retry_model: str = "medium"
+    no_text_retry_filter: str = "highpass=f=80,dynaudnorm=f=150:g=15"
+    silence_peak_db: float = -50.0
+    quality_active_db: float = -45.0
+    min_active_audio_seconds: float = 0.15
+    clipping_peak_db: float = -0.1
     device: str = "auto"
     transcription_timeout_seconds: int = 14400
     chunk_seconds: float = 900.0
@@ -99,6 +115,9 @@ class Config:
     nice_level: int = 20
     log_max_bytes: int = 2_000_000
     log_backups: int = 3
+    database_backups: int = 5
+    orphan_retention_days: int = 7
+    failed_retention_days: int = 0
     corrections: dict[str, str] = dataclasses.field(default_factory=dict)
 
     @property
@@ -153,6 +172,10 @@ class Config:
     def lock_dir(self) -> Path:
         return self.state_root / ".pipeline.lock"
 
+    @property
+    def backups_dir(self) -> Path:
+        return self.state_root / "Backups"
+
 
 def _expand_path(value: str | Path) -> Path:
     return Path(os.path.expandvars(os.path.expanduser(str(value)))).resolve()
@@ -167,8 +190,6 @@ def load_config(path: Path | None) -> Config:
         return cfg
     if not path.exists():
         raise PipelineError(f"Configuration file not found: {path}")
-    if tomllib is None:
-        raise PipelineError("TOML configuration requires Python 3.11 or newer")
     with path.open("rb") as handle:
         data = tomllib.load(handle)
 
@@ -177,6 +198,7 @@ def load_config(path: Path | None) -> Config:
             "mount_point": "mount_point", "recorder_subdir": "recorder_subdir",
             "vault": "vault", "recordings_folder": "recordings_folder",
             "state_root": "state_root", "attachments_folder": "attachments_folder",
+            "recorder_volume_uuid": "recorder_volume_uuid",
         },
         "output": {
             "template": "note_template", "generate_title": "generate_title",
@@ -186,6 +208,9 @@ def load_config(path: Path | None) -> Config:
             "stable_wait_seconds": "stable_wait_seconds", "keep_audio": "keep_audio",
             "discard_after_days": "discard_after_days", "retry_count": "import_retry_count",
             "copy_timeout_seconds": "copy_timeout_seconds",
+            "stable_check_count": "stable_check_count", "readiness_probe_seconds": "readiness_probe_seconds",
+            "retry_base_seconds": "retry_base_seconds", "retry_max_seconds": "retry_max_seconds",
+            "orphan_retention_days": "orphan_retention_days", "failed_retention_days": "failed_retention_days",
         },
         "transcription": {
             "backend": "backend", "model": "model", "retry_model": "retry_model",
@@ -194,6 +219,10 @@ def load_config(path: Path | None) -> Config:
             "word_timestamps": "word_timestamps", "vad_enabled": "vad_enabled",
             "vad_noise_db": "vad_noise_db", "vad_min_silence_seconds": "vad_min_silence_seconds",
             "vad_padding_seconds": "vad_padding_seconds", "audio_filter": "audio_filter",
+            "no_text_retry_model": "no_text_retry_model",
+            "no_text_retry_filter": "no_text_retry_filter", "silence_peak_db": "silence_peak_db",
+            "quality_active_db": "quality_active_db",
+            "min_active_audio_seconds": "min_active_audio_seconds", "clipping_peak_db": "clipping_peak_db",
             "device": "device", "timeout_seconds": "transcription_timeout_seconds",
             "chunk_seconds": "chunk_seconds", "chunk_overlap_seconds": "chunk_overlap_seconds",
             "max_direct_seconds": "max_direct_seconds",
@@ -207,7 +236,7 @@ def load_config(path: Path | None) -> Config:
         "behavior": {
             "notify": "notify", "prevent_sleep": "prevent_sleep", "log_max_bytes": "log_max_bytes",
             "log_backups": "log_backups", "nice_level": "nice_level",
-            "unmount_on_success": "unmount_on_success",
+            "unmount_on_success": "unmount_on_success", "database_backups": "database_backups",
         },
     }
     path_fields = {"mount_point", "vault", "state_root", "note_template"}
@@ -259,6 +288,18 @@ def ensure_private_directories(cfg: Config) -> None:
         raise PipelineError("transcription.max_direct_seconds must be greater than zero and no larger than chunk_seconds")
     if cfg.max_unknown_duration_bytes <= 0:
         raise PipelineError("transcription.max_unknown_duration_bytes must be greater than zero")
+    if cfg.stable_check_count < 2:
+        raise PipelineError("import.stable_check_count must be at least 2")
+    if cfg.stable_wait_seconds < 0 or cfg.readiness_probe_seconds <= 0:
+        raise PipelineError("import stability and readiness intervals must be positive")
+    if cfg.retry_base_seconds <= 0 or cfg.retry_max_seconds < cfg.retry_base_seconds:
+        raise PipelineError("import retry timing is invalid")
+    if not isinstance(cfg.silence_peak_db, (int, float)) or not -120 <= cfg.silence_peak_db <= 0:
+        raise PipelineError("transcription.silence_peak_db must be between -120 and 0")
+    if not cfg.no_text_retry_model:
+        raise PipelineError("transcription.no_text_retry_model cannot be empty")
+    if cfg.min_active_audio_seconds < 0:
+        raise PipelineError("transcription.min_active_audio_seconds cannot be negative")
     if not isinstance(cfg.nice_level, int) or not 0 <= cfg.nice_level <= 20:
         raise PipelineError("behavior.nice_level must be an integer from 0 through 20")
     if cfg.ollama_start_timeout_seconds <= 0:
@@ -266,7 +307,7 @@ def ensure_private_directories(cfg: Config) -> None:
     old_umask = os.umask(0o077)
     try:
         for path in (cfg.state_root, cfg.incoming_dir, cfg.processing_dir, cfg.archive_dir, cfg.failed_dir,
-                     cfg.transcripts_dir, cfg.summaries_dir, cfg.chunks_dir):
+                     cfg.transcripts_dir, cfg.summaries_dir, cfg.chunks_dir, cfg.backups_dir):
             path.mkdir(parents=True, exist_ok=True, mode=0o700)
         cfg.notes_folder.mkdir(parents=True, exist_ok=True)
     finally:
@@ -305,6 +346,13 @@ def apply_process_priority(nice_level: int) -> int | None:
 
 def now_iso() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+
+
+def peak_rss_bytes() -> int:
+    values = [resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
+              resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss]
+    peak = int(max(values))
+    return peak if platform.system() == "Darwin" else peak * 1024
 
 
 def atomic_write(path: Path, content: str, mode: int = 0o600) -> None:
@@ -412,12 +460,18 @@ def operation_timeout(seconds: int, message: str) -> Iterator[None]:
 
 
 class StateDB:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, backup_count: int = 5):
         path.parent.mkdir(parents=True, exist_ok=True)
+        existed = path.exists() and path.stat().st_size > 0
+        self.path = path
+        self.backup_count = max(1, backup_count)
         self.conn = sqlite3.connect(path)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA foreign_keys=ON")
+        old_version = int(self.conn.execute("PRAGMA user_version").fetchone()[0])
+        if existed and old_version < DB_SCHEMA_VERSION:
+            self.create_backup("pre-migration")
         self.conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS recordings (
@@ -446,7 +500,16 @@ class StateDB:
                 summary_model TEXT,
                 generated_title TEXT,
                 transcription_generation INTEGER NOT NULL DEFAULT 0,
+                no_text_retries INTEGER NOT NULL DEFAULT 0,
+                next_retry_at TEXT,
+                consecutive_failures INTEGER NOT NULL DEFAULT 0,
+                source_volume_uuid TEXT,
                 duration_seconds REAL,
+                audio_mean_db REAL,
+                audio_peak_db REAL,
+                audio_active_seconds REAL,
+                audio_clipping_percent REAL,
+                audio_quality_json TEXT,
                 transcribe_seconds REAL,
                 summary_seconds REAL,
                 created_at TEXT NOT NULL,
@@ -456,6 +519,27 @@ class StateDB:
             CREATE INDEX IF NOT EXISTS idx_recordings_status ON recordings(status);
             CREATE INDEX IF NOT EXISTS idx_recordings_sha ON recordings(sha256);
             CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS runs (
+                id INTEGER PRIMARY KEY,
+                command TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                finished_at TEXT,
+                status TEXT NOT NULL DEFAULT 'running',
+                volume_uuid TEXT,
+                found INTEGER NOT NULL DEFAULT 0,
+                imported INTEGER NOT NULL DEFAULT 0,
+                completed INTEGER NOT NULL DEFAULT 0,
+                no_speech INTEGER NOT NULL DEFAULT 0,
+                ignored INTEGER NOT NULL DEFAULT 0,
+                failed INTEGER NOT NULL DEFAULT 0,
+                model TEXT,
+                retry_model TEXT,
+                summary_model TEXT,
+                peak_rss_bytes INTEGER,
+                unmounted INTEGER NOT NULL DEFAULT 0,
+                error TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_runs_started ON runs(started_at);
             """
         )
         self.conn.commit()
@@ -466,6 +550,95 @@ class StateDB:
             self.conn.execute("ALTER TABLE recordings ADD COLUMN summary_model TEXT")
         if "transcription_generation" not in columns:
             self.conn.execute("ALTER TABLE recordings ADD COLUMN transcription_generation INTEGER NOT NULL DEFAULT 0")
+        if "no_text_retries" not in columns:
+            self.conn.execute("ALTER TABLE recordings ADD COLUMN no_text_retries INTEGER NOT NULL DEFAULT 0")
+        additions = {
+            "next_retry_at": "TEXT",
+            "consecutive_failures": "INTEGER NOT NULL DEFAULT 0",
+            "source_volume_uuid": "TEXT",
+            "audio_mean_db": "REAL",
+            "audio_peak_db": "REAL",
+            "audio_active_seconds": "REAL",
+            "audio_clipping_percent": "REAL",
+            "audio_quality_json": "TEXT",
+        }
+        for name, declaration in additions.items():
+            if name not in columns:
+                self.conn.execute(f"ALTER TABLE recordings ADD COLUMN {name} {declaration}")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_recordings_retry ON recordings(status,next_retry_at)")
+        self.conn.execute(f"PRAGMA user_version={DB_SCHEMA_VERSION}")
+        self.conn.commit()
+
+    def create_backup(self, label: str = "manual", output: Path | None = None) -> Path:
+        backup_dir = self.path.parent / "Backups"
+        backup_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if output is None:
+            stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+            output = backup_dir / f"state-{label}-{stamp}.sqlite3"
+        output = output.resolve()
+        if output == self.path.resolve():
+            raise PipelineError("Database backup output cannot overwrite the active state database")
+        output.parent.mkdir(parents=True, exist_ok=True)
+        destination = sqlite3.connect(output)
+        try:
+            self.conn.backup(destination)
+        finally:
+            destination.close()
+        os.chmod(output, 0o600)
+        backups = sorted(backup_dir.glob("state-*.sqlite3"), key=lambda item: item.stat().st_mtime, reverse=True)
+        for stale in backups[self.backup_count:]:
+            with contextlib.suppress(OSError):
+                stale.unlink()
+        return output
+
+    def integrity_check(self) -> tuple[bool, str]:
+        rows = [str(row[0]) for row in self.conn.execute("PRAGMA quick_check")]
+        detail = "; ".join(rows)
+        return rows == ["ok"], detail
+
+    def export_sql(self, output: Path) -> Path:
+        if output.resolve() == self.path.resolve():
+            raise PipelineError("Database export output cannot overwrite the active state database")
+        content = "\n".join(self.conn.iterdump()) + "\n"
+        atomic_write(output.resolve(), content, mode=0o600)
+        return output.resolve()
+
+    def repair(self) -> tuple[bool, str, Path]:
+        backup = self.create_backup("pre-repair")
+        self.conn.execute("REINDEX")
+        self.conn.commit()
+        self.conn.execute("VACUUM")
+        ok, detail = self.integrity_check()
+        return ok, detail, backup
+
+    def metadata_get(self, key: str) -> str | None:
+        row = self.conn.execute("SELECT value FROM metadata WHERE key=?", (key,)).fetchone()
+        return str(row[0]) if row else None
+
+    def metadata_set(self, key: str, value: str) -> None:
+        self.conn.execute("INSERT OR REPLACE INTO metadata(key,value) VALUES(?,?)", (key, value))
+        self.conn.commit()
+
+    def start_run(self, command: str, cfg: Config, volume_uuid: str | None = None) -> int:
+        cursor = self.conn.execute(
+            """INSERT INTO runs(command,started_at,volume_uuid,model,retry_model,summary_model)
+               VALUES(?,?,?,?,?,?)""",
+            (command, now_iso(), volume_uuid, cfg.model, cfg.no_text_retry_model, cfg.summary_model),
+        )
+        self.conn.commit()
+        return int(cursor.lastrowid)
+
+    def finish_run(self, run_id: int, status: str, metrics: dict[str, Any], error: str | None = None) -> None:
+        self.conn.execute(
+            """UPDATE runs SET finished_at=?,status=?,found=?,imported=?,completed=?,no_speech=?,ignored=?,
+               failed=?,peak_rss_bytes=?,unmounted=?,error=? WHERE id=?""",
+            (
+                now_iso(), status, int(metrics.get("found", 0)), int(metrics.get("imported", 0)),
+                int(metrics.get("completed", 0)), int(metrics.get("no_speech", 0)),
+                int(metrics.get("ignored", 0)), int(metrics.get("failed", 0)),
+                peak_rss_bytes(), int(bool(metrics.get("unmounted", False))), error, run_id,
+            ),
+        )
         self.conn.commit()
 
     def close(self) -> None:
@@ -486,13 +659,16 @@ class StateDB:
             raise PipelineError(f"Unknown recording id: {record_id}")
         return row
 
-    def add_detected(self, path: Path, stat: os.stat_result, fingerprint: str) -> int:
+    def add_detected(
+        self, path: Path, stat: os.stat_result, fingerprint: str, volume_uuid: str | None = None,
+    ) -> int:
         timestamp = now_iso()
         cursor = self.conn.execute(
             """INSERT OR IGNORE INTO recordings
-               (source_fingerprint, source_path, source_name, source_size, source_mtime_ns, status, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, 'detected', ?, ?)""",
-            (fingerprint, str(path), path.name, stat.st_size, stat.st_mtime_ns, timestamp, timestamp),
+               (source_fingerprint, source_path, source_name, source_size, source_mtime_ns, source_volume_uuid,
+                status, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, 'detected', ?, ?)""",
+            (fingerprint, str(path), path.name, stat.st_size, stat.st_mtime_ns, volume_uuid, timestamp, timestamp),
         )
         self.conn.commit()
         if cursor.lastrowid:
@@ -548,40 +724,94 @@ class StateDB:
             return float(row[0]) / float(row[1])
         return None
 
-    def migrate_legacy_hashes(self, legacy_path: Path, logger: logging.Logger) -> int:
-        marker = self.conn.execute("SELECT value FROM metadata WHERE key='legacy_hashes_migrated'").fetchone()
-        if marker or not legacy_path.exists():
-            return 0
-        count = 0
-        for line in legacy_path.read_text(encoding="utf-8", errors="replace").splitlines():
-            digest = line.strip().lower()
-            if not re.fullmatch(r"[0-9a-f]{64}", digest):
-                continue
-            timestamp = now_iso()
-            before = self.conn.total_changes
-            self.conn.execute(
-                """INSERT OR IGNORE INTO recordings
-                   (source_fingerprint, source_path, source_name, source_size, source_mtime_ns, sha256, status,
-                    created_at, updated_at, completed_at)
-                   VALUES (?, ?, ?, 0, 0, ?, 'completed', ?, ?, ?)""",
-                (f"legacy:{digest}", "legacy", f"legacy-{digest[:8]}", digest, timestamp, timestamp, timestamp),
-            )
-            count += int(self.conn.total_changes > before)
-        self.conn.execute("INSERT OR REPLACE INTO metadata(key,value) VALUES('legacy_hashes_migrated',?)", (now_iso(),))
-        self.conn.commit()
-        if count:
-            logger.info("Migrated %d legacy processed hashes", count)
-        return count
-
-
 @dataclasses.dataclass(frozen=True)
 class Candidate:
     path: Path
     stat: os.stat_result
     fingerprint: str
+    volume_uuid: str | None = None
 
 
-def scan_recorder(cfg: Config, db: StateDB) -> list[Candidate]:
+@dataclasses.dataclass(frozen=True)
+class VolumeIdentity:
+    uuid: str
+    device: str
+    name: str
+
+
+def read_volume_identity(mount_point: Path) -> VolumeIdentity | None:
+    """Read stable macOS volume identity without writing to the recorder."""
+    if platform.system() != "Darwin" or mount_point.parent != Path("/Volumes"):
+        return None
+    diskutil = Path("/usr/sbin/diskutil")
+    if not diskutil.is_file() or not mount_point.exists():
+        return None
+    result = subprocess.run(
+        [str(diskutil), "info", "-plist", str(mount_point)],
+        capture_output=True, timeout=20, check=False,
+    )
+    if result.returncode != 0:
+        return None
+    try:
+        data = plistlib.loads(result.stdout)
+    except (plistlib.InvalidFileException, ValueError):
+        return None
+    uuid = str(data.get("VolumeUUID") or data.get("DiskUUID") or "").strip().upper()
+    if not uuid:
+        return None
+    return VolumeIdentity(
+        uuid=uuid,
+        device=str(data.get("DeviceIdentifier") or "unknown"),
+        name=str(data.get("VolumeName") or mount_point.name),
+    )
+
+
+def verify_recorder_identity(cfg: Config, db: StateDB, logger: logging.Logger) -> VolumeIdentity | None:
+    if not cfg.recorder_folder.is_dir():
+        return None
+    if cfg.mount_point.parent != Path("/Volumes") and not cfg.recorder_volume_uuid:
+        return None
+    identity = read_volume_identity(cfg.mount_point)
+    if identity is None:
+        raise PipelineError(f"Unable to verify recorder volume identity: {cfg.mount_point}")
+    expected = (cfg.recorder_volume_uuid or db.metadata_get("recorder_volume_uuid") or "").strip().upper()
+    if expected and identity.uuid != expected:
+        raise PipelineError(
+            f"Recorder UUID mismatch at {cfg.mount_point}: expected {expected}, found {identity.uuid}"
+        )
+    if not expected:
+        db.metadata_set("recorder_volume_uuid", identity.uuid)
+        logger.info("Bound recorder identity to volume UUID %s", identity.uuid)
+    logger.debug("Verified recorder volume: %s (%s, %s)", identity.name, identity.uuid, identity.device)
+    return identity
+
+
+def is_macos_metadata_file(path: Path) -> bool:
+    """Identify AppleSingle/AppleDouble containers by their binary header."""
+    # A ._ prefix is only a hint. Always inspect the header so a legitimate
+    # recording with that name is retained and a renamed sidecar is rejected.
+    try:
+        with path.open("rb") as handle:
+            header = handle.read(8)
+    except OSError:
+        return False
+    return header[:4] in APPLE_METADATA_MAGICS and header[4:8] in APPLE_METADATA_VERSIONS
+
+
+def retry_is_due(row: sqlite3.Row) -> bool:
+    value = row["next_retry_at"] if "next_retry_at" in row.keys() else None
+    if not value:
+        return True
+    try:
+        scheduled = dt.datetime.fromisoformat(str(value))
+        if scheduled.tzinfo is None:
+            scheduled = scheduled.replace(tzinfo=dt.timezone.utc)
+        return scheduled <= dt.datetime.now(dt.timezone.utc)
+    except ValueError:
+        return True
+
+
+def scan_recorder(cfg: Config, db: StateDB, volume_uuid: str | None = None) -> list[Candidate]:
     folder = cfg.recorder_folder
     if not folder.is_dir():
         raise PipelineError(f"Recorder folder not found: {folder}")
@@ -592,33 +822,99 @@ def scan_recorder(cfg: Config, db: StateDB) -> list[Candidate]:
             path = Path(root) / name
             if path.suffix.lower() not in AUDIO_SUFFIXES:
                 continue
+            if is_macos_metadata_file(path):
+                continue
             try:
                 stat = path.stat()
             except OSError:
                 continue
             fingerprint = source_fingerprint(path, stat)
             known = db.get_by_fingerprint(fingerprint)
-            if known is None or known["status"] == "detected" or (known["status"] == "failed" and known["failed_stage"] == "copy"):
-                candidates.append(Candidate(path, stat, fingerprint))
+            if (known is None or known["status"] == "detected" or
+                    (known["status"] == "failed" and known["failed_stage"] == "copy" and retry_is_due(known))):
+                candidates.append(Candidate(path, stat, fingerprint, volume_uuid))
     return candidates
 
 
-def wait_until_stable(candidate: Candidate, seconds: float) -> os.stat_result:
-    first = candidate.path.stat()
-    if seconds > 0:
-        time.sleep(seconds)
-    second = candidate.path.stat()
-    if (first.st_size != second.st_size or first.st_mtime_ns != second.st_mtime_ns or
-            candidate.stat.st_size != second.st_size or candidate.stat.st_mtime_ns != second.st_mtime_ns):
-        raise PipelineError(f"Recording is still changing: {candidate.path.name}")
-    return second
+def wait_until_stable(candidate: Candidate, seconds: float, checks: int = 2) -> os.stat_result:
+    previous = candidate.stat
+    checks = max(2, checks)
+    for index in range(checks):
+        current = candidate.path.stat()
+        if current.st_size <= 0:
+            raise PipelineError(f"Recording is empty: {candidate.path.name}")
+        if previous.st_size != current.st_size or previous.st_mtime_ns != current.st_mtime_ns:
+            raise PipelineError(f"Recording is still changing: {candidate.path.name}")
+        previous = current
+        if index + 1 < checks and seconds > 0:
+            time.sleep(seconds)
+    return previous
+
+
+def audio_header_matches(path: Path) -> bool:
+    try:
+        with path.open("rb") as handle:
+            header = handle.read(4096)
+    except OSError:
+        return False
+    suffix = path.suffix.lower()
+    if suffix == ".mp3":
+        return header.startswith(b"ID3") or any(
+            header[index] == 0xFF and header[index + 1] & 0xE0 == 0xE0
+            for index in range(max(0, len(header) - 1))
+        )
+    if suffix == ".wav":
+        return len(header) >= 12 and header[:4] in {b"RIFF", b"RF64"} and header[8:12] == b"WAVE"
+    if suffix == ".flac":
+        return header.startswith(b"fLaC")
+    if suffix == ".ogg":
+        return header.startswith(b"OggS")
+    if suffix in {".m4a", ".aac"}:
+        return (len(header) >= 12 and header[4:8] == b"ftyp") or (
+            len(header) >= 2 and header[0] == 0xFF and header[1] & 0xF0 == 0xF0
+        )
+    return False
+
+
+def validate_audio_ready(path: Path, cfg: Config) -> None:
+    if cfg.backend == "mock":
+        return
+    if not audio_header_matches(path):
+        raise PipelineError(f"Audio header is invalid or unsupported: {path.name}")
+    if shutil.which("ffprobe") is None or shutil.which("ffmpeg") is None:
+        raise PipelineError("FFmpeg and FFprobe are required to validate recorder audio")
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries", "stream=codec_name",
+         "-of", "default=nw=1:nk=1", str(path)],
+        text=True, capture_output=True, timeout=30, check=False,
+    )
+    if probe.returncode != 0 or not probe.stdout.strip():
+        raise PipelineError(f"Audio stream could not be read: {path.name}: {probe.stderr.strip()[-500:]}")
+    decoded = subprocess.run(
+        ["ffmpeg", "-v", "error", "-nostdin", "-i", str(path), "-t", f"{cfg.readiness_probe_seconds:.3f}",
+         "-map", "0:a:0", "-f", "null", "-"],
+        text=True, capture_output=True, timeout=60, check=False,
+    )
+    if decoded.returncode != 0:
+        raise PipelineError(f"Audio decode validation failed: {path.name}: {decoded.stderr.strip()[-500:]}")
+
+
+def schedule_copy_retry(db: StateDB, record_id: int, cfg: Config, error: str) -> None:
+    row = db.get(record_id)
+    failures = int(row["consecutive_failures"] or 0) + 1
+    delay = min(cfg.retry_max_seconds, cfg.retry_base_seconds * (2 ** max(0, failures - 1)))
+    next_retry = dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=delay)
+    db.update(
+        record_id, status="failed", failed_stage="copy", last_error=error,
+        consecutive_failures=failures, next_retry_at=next_retry.isoformat(timespec="seconds"),
+    )
 
 
 def copy_candidate(candidate: Candidate, cfg: Config, db: StateDB, logger: logging.Logger, dry_run: bool = False) -> str:
     if dry_run:
         logger.info("Would import: %s (%d bytes)", candidate.path, candidate.stat.st_size)
         return "would-import"
-    record_id = db.add_detected(candidate.path, candidate.stat, candidate.fingerprint)
+    record_id = db.add_detected(candidate.path, candidate.stat, candidate.fingerprint, candidate.volume_uuid)
     row = db.get(record_id)
     if row["status"] == "failed" and row["failed_stage"] == "copy":
         db.update(record_id, status="detected", failed_stage=None, last_error=None)
@@ -627,7 +923,12 @@ def copy_candidate(candidate: Candidate, cfg: Config, db: StateDB, logger: loggi
         return str(row["status"])
     partial: Path | None = None
     try:
-        stable_stat = wait_until_stable(candidate, cfg.stable_wait_seconds)
+        stable_stat = wait_until_stable(candidate, cfg.stable_wait_seconds, cfg.stable_check_count)
+        validate_audio_ready(candidate.path, cfg)
+        verified_stat = candidate.path.stat()
+        if (verified_stat.st_size != stable_stat.st_size or
+                verified_stat.st_mtime_ns != stable_stat.st_mtime_ns):
+            raise PipelineError(f"Recording changed during decode validation: {candidate.path.name}")
         free = shutil.disk_usage(cfg.incoming_dir).free
         required = stable_stat.st_size + max(100 * 1024 * 1024, int(stable_stat.st_size * 0.10))
         if free < required:
@@ -658,16 +959,19 @@ def copy_candidate(candidate: Candidate, cfg: Config, db: StateDB, logger: loggi
             return "duplicate"
         os.replace(partial, destination)
         os.utime(destination, ns=(stable_stat.st_atime_ns, stable_stat.st_mtime_ns))
-        duration = ffprobe_duration(destination)
+        quality = analyze_audio_quality(destination, cfg, logger) if cfg.backend != "mock" else None
+        duration = quality.duration_seconds if quality else ffprobe_duration(destination)
         db.update(record_id, sha256=digest, local_path=str(destination), source_size=stable_stat.st_size,
-                  source_mtime_ns=stable_stat.st_mtime_ns, duration_seconds=duration, status="ready")
+                  source_mtime_ns=stable_stat.st_mtime_ns, duration_seconds=duration, status="ready",
+                  next_retry_at=None, consecutive_failures=0,
+                  audio_quality_json=quality.to_json() if quality else None)
         logger.info("Imported: %s → %s", candidate.path.name, destination.name)
         return "ready"
     except Exception as exc:
         if partial is not None:
             with contextlib.suppress(FileNotFoundError):
                 partial.unlink()
-        db.update(record_id, status="failed", failed_stage="copy", last_error=str(exc))
+        schedule_copy_retry(db, record_id, cfg, str(exc))
         logger.error("Import failed for %s: %s", candidate.path.name, exc)
         notify_error(f"Import failed for {candidate.path.name}: {exc}", cfg)
         return "failed"
@@ -686,6 +990,128 @@ def ffprobe_duration(path: Path) -> float | None:
         return None
 
 
+@dataclasses.dataclass(frozen=True)
+class AudioQuality:
+    duration_seconds: float
+    mean_db: float
+    peak_db: float
+    active_seconds: float
+    clipping_percent: float
+    warnings: tuple[str, ...] = ()
+
+    def is_silent(self, cfg: Config) -> bool:
+        return self.peak_db <= cfg.silence_peak_db or self.active_seconds < cfg.min_active_audio_seconds
+
+    def to_json(self) -> str:
+        return json.dumps(dataclasses.asdict(self))
+
+    @classmethod
+    def from_json(cls, value: str | None) -> "AudioQuality | None":
+        if not value:
+            return None
+        try:
+            data = json.loads(value)
+            return cls(
+                duration_seconds=float(data["duration_seconds"]), mean_db=float(data["mean_db"]),
+                peak_db=float(data["peak_db"]), active_seconds=float(data["active_seconds"]),
+                clipping_percent=float(data["clipping_percent"]),
+                warnings=tuple(str(item) for item in data.get("warnings") or ()),
+            )
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+            return None
+
+
+def _parse_db_stat(text: str, label: str) -> float | None:
+    matches = re.findall(rf"{re.escape(label)}:\s*(-?inf|-?[0-9.]+)", text, re.IGNORECASE)
+    if not matches:
+        return None
+    value = matches[-1].lower()
+    return float("-inf") if value == "-inf" else float(value)
+
+
+def silence_intervals(text: str, duration: float) -> list[tuple[float, float]]:
+    starts = [float(value) for value in re.findall(r"silence_start:\s*([0-9.]+)", text)]
+    ends = [float(value) for value in re.findall(r"silence_end:\s*([0-9.]+)", text)]
+    intervals: list[tuple[float, float]] = []
+    end_index = 0
+    for start in starts:
+        while end_index < len(ends) and ends[end_index] <= start:
+            end_index += 1
+        end = ends[end_index] if end_index < len(ends) else duration
+        intervals.append((min(start, duration), min(end, duration)))
+        end_index += 1
+    return intervals
+
+
+def analyze_audio_quality(path: Path, cfg: Config, logger: logging.Logger) -> AudioQuality | None:
+    """Decode audio once to report level, active duration, and approximate clipping."""
+    if shutil.which("ffmpeg") is None:
+        logger.warning("Cannot analyze audio quality because FFmpeg was not found")
+        return None
+    duration = ffprobe_duration(path)
+    if not duration:
+        return None
+    filter_value = (
+        f"silencedetect=noise={cfg.quality_active_db}dB:d=0.05,"
+        "astats=metadata=0:reset=0"
+    )
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-nostats", "-nostdin", "-i", str(path), "-vn",
+             "-af", filter_value, "-f", "null", "-"],
+            text=True, capture_output=True, timeout=max(60, int(duration * 2)), check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        logger.warning("Unable to analyze audio quality for %s: %s", path.name, exc)
+        return None
+    if result.returncode != 0:
+        logger.warning("Unable to analyze audio quality for %s: %s", path.name, result.stderr.strip()[-1000:])
+        return None
+    mean_db = _parse_db_stat(result.stderr, "RMS level dB")
+    peak_db = _parse_db_stat(result.stderr, "Peak level dB")
+    if mean_db is None or peak_db is None:
+        logger.warning("FFmpeg did not report audio quality statistics for %s", path.name)
+        return None
+
+    silence_seconds = sum(max(0.0, end - start) for start, end in silence_intervals(result.stderr, duration))
+    active_seconds = max(0.0, duration - min(duration, silence_seconds))
+
+    peak_counts = re.findall(r"Peak count:\s*([0-9.eE+-]+)", result.stderr)
+    sample_counts = re.findall(r"Number of samples:\s*([0-9.eE+-]+)", result.stderr)
+    clipping_percent = 0.0
+    if peak_db >= cfg.clipping_peak_db and peak_counts and sample_counts:
+        with contextlib.suppress(ValueError, ZeroDivisionError):
+            clipping_percent = 100.0 * float(peak_counts[-1]) / float(sample_counts[-1])
+
+    warnings: list[str] = []
+    if active_seconds < cfg.min_active_audio_seconds:
+        warnings.append("too-little-active-audio")
+    if peak_db <= cfg.silence_peak_db:
+        warnings.append("very-low-level")
+    if clipping_percent >= 0.1:
+        warnings.append("clipping")
+    if duration > 0 and active_seconds / duration < 0.02:
+        warnings.append("mostly-silent")
+    quality = AudioQuality(
+        duration_seconds=duration, mean_db=mean_db, peak_db=peak_db,
+        active_seconds=active_seconds, clipping_percent=clipping_percent,
+        warnings=tuple(dict.fromkeys(warnings)),
+    )
+    if quality.warnings:
+        logger.warning("Audio quality warning for %s: %s", path.name, ", ".join(quality.warnings))
+    else:
+        logger.debug(
+            "Audio quality for %s: mean %.1f dB, peak %.1f dB, active %.2fs, clipping %.4f%%",
+            path.name, quality.mean_db, quality.peak_db, quality.active_seconds, quality.clipping_percent,
+        )
+    return quality
+
+
+def audio_quality_warnings(value: str | None) -> tuple[str, ...]:
+    quality = AudioQuality.from_json(value)
+    return quality.warnings if quality else (() if not value else ("invalid-quality-metadata",))
+
+
 def detect_speech_clips(path: Path, cfg: Config, logger: logging.Logger) -> list[float] | None:
     """Return Whisper clip timestamps using FFmpeg silence detection."""
     if not cfg.vad_enabled or shutil.which("ffmpeg") is None:
@@ -699,16 +1125,7 @@ def detect_speech_clips(path: Path, cfg: Config, logger: logging.Logger) -> list
         text=True, capture_output=True, timeout=max(60, int(duration * 2)), check=False,
     )
     text = result.stderr
-    starts = [float(v) for v in re.findall(r"silence_start:\s*([0-9.]+)", text)]
-    ends = [float(v) for v in re.findall(r"silence_end:\s*([0-9.]+)", text)]
-    silences: list[tuple[float, float]] = []
-    end_index = 0
-    for start in starts:
-        while end_index < len(ends) and ends[end_index] <= start:
-            end_index += 1
-        end = ends[end_index] if end_index < len(ends) else duration
-        silences.append((start, min(end, duration)))
-        end_index += 1
+    silences = silence_intervals(text, duration)
     if not silences:
         return None
     speech: list[tuple[float, float]] = []
@@ -1042,6 +1459,8 @@ class Transcriber:
 
     def prepare_models(self) -> None:
         models = [self.cfg.model]
+        if self.cfg.no_text_retry_model not in models:
+            models.append(self.cfg.no_text_retry_model)
         if self.cfg.hybrid_retry and self.cfg.retry_model not in models:
             models.append(self.cfg.retry_model)
         if self.backend == "mlx":
@@ -1209,6 +1628,13 @@ def probe_ollama(cfg: Config, timeout: float = 2.0) -> dict[str, Any]:
         return json.loads(response.read().decode("utf-8"))
 
 
+def ollama_model_names(cfg: Config, timeout: float = 5.0) -> set[str]:
+    return {
+        str(item.get("name", "")).split(":")[0]
+        for item in probe_ollama(cfg, timeout).get("models", [])
+    }
+
+
 def ensure_ollama_running(cfg: Config, logger: logging.Logger) -> bool:
     """Start a detached local Ollama server when summarization needs one.
 
@@ -1282,38 +1708,11 @@ def timestamped_text(result: dict[str, Any]) -> str:
     return "\n".join(f"[{format_timestamp(float(segment['start']))}] {str(segment['text']).strip()}" for segment in result["segments"])
 
 
-DEFAULT_NOTE_TEMPLATE = """---
-date: {{date}}
-time_recorded: {{time_recorded}}
-source: "Sony ICD-UX570"
-original_file: {{original_file}}
-original_path: {{original_path}}
-file_hash: {{file_hash}}
-audio_duration_seconds: {{duration_seconds}}
-language: {{language}}
-transcription_backend: {{backend}}
-transcription_model: {{model}}
-transcription_version: {{model_version}}
-transcription_seconds: {{transcription_seconds}}
-summary_model: {{summary_model}}
-summary_seconds: {{summary_seconds}}
-processed_at: {{processed_at}}
-tags:
-  - recording/transcribed
----
-
-{{title_heading}}
-
-{{audio_link}}
-
-## Summary
-
-{{summary}}
-
-## Full Transcript
-
-{{transcript}}
-"""
+DEFAULT_NOTE_TEMPLATE_PATH = Path(__file__).with_name("default-note-template.txt")
+try:
+    DEFAULT_NOTE_TEMPLATE = DEFAULT_NOTE_TEMPLATE_PATH.read_text(encoding="utf-8")
+except OSError:
+    DEFAULT_NOTE_TEMPLATE = ""
 
 
 def render_template(template: str, values: dict[str, str]) -> str:
@@ -1394,6 +1793,61 @@ class Pipeline:
         self.transcriber = None
         gc.collect()
 
+    def _recording_quality(
+        self, row: sqlite3.Row, audio_path: Path, *, analyze_missing: bool = True,
+    ) -> AudioQuality | None:
+        quality = AudioQuality.from_json(row["audio_quality_json"])
+        if quality is None and row["audio_peak_db"] is not None and row["audio_active_seconds"] is not None:
+            quality = AudioQuality(
+                duration_seconds=float(row["duration_seconds"] or 0),
+                mean_db=float(row["audio_mean_db"] or float("-inf")),
+                peak_db=float(row["audio_peak_db"]),
+                active_seconds=float(row["audio_active_seconds"]),
+                clipping_percent=float(row["audio_clipping_percent"] or 0),
+            )
+        if quality is None and analyze_missing:
+            quality = analyze_audio_quality(audio_path, self.cfg, self.logger)
+            if quality:
+                self.db.update(
+                    int(row["id"]), duration_seconds=quality.duration_seconds,
+                    audio_quality_json=quality.to_json(),
+                )
+        return quality
+
+    def _retry_blank_transcript(
+        self, row: sqlite3.Row, audio_path: Path,
+    ) -> tuple[dict[str, Any], float, str]:
+        retries = int(row["no_text_retries"] or 0)
+        if retries >= 1:
+            raise NeedsReviewError("Blank transcription recovery was already attempted")
+        self.db.update(int(row["id"]), no_text_retries=retries + 1)
+        recovery_model = self.cfg.no_text_retry_model
+        recovery_filter = ",".join(
+            value for value in (self.cfg.audio_filter, self.cfg.no_text_retry_filter) if value
+        )
+        self.logger.warning(
+            "Audio is present but transcription was blank; retrying once with %s, normalization, and VAD disabled",
+            recovery_model,
+        )
+        self._release_transcriber()
+        original_model = self.cfg.model
+        original_filter = self.cfg.audio_filter
+        original_vad = self.cfg.vad_enabled
+        try:
+            self.cfg.model = recovery_model
+            self.cfg.audio_filter = recovery_filter
+            self.cfg.vad_enabled = False
+            result, elapsed = self._transcribe_record(self.db.get(int(row["id"])), audio_path)
+            return result, elapsed, recovery_model
+        except NeedsReviewError:
+            raise
+        except Exception as exc:
+            raise NeedsReviewError(f"Blank transcription recovery failed: {exc}") from exc
+        finally:
+            self.cfg.model = original_model
+            self.cfg.audio_filter = original_filter
+            self.cfg.vad_enabled = original_vad
+
     def _chunk_cache_dir(self, row: sqlite3.Row) -> Path:
         settings = {
             "format": 1,
@@ -1433,7 +1887,8 @@ class Pipeline:
 
     def import_new(self, dry_run: bool = False, missing_ok: bool = False) -> dict[str, int]:
         try:
-            candidates = scan_recorder(self.cfg, self.db)
+            identity = verify_recorder_identity(self.cfg, self.db, self.logger)
+            candidates = scan_recorder(self.cfg, self.db, identity.uuid if identity else None)
         except PipelineError:
             if not missing_ok:
                 raise
@@ -1522,10 +1977,95 @@ class Pipeline:
                 }, ensure_ascii=False, indent=2) + "\n")
             results.append(chunk_result)
         result = merge_chunk_results(results)
-        if not result["text"]:
-            raise PipelineError("All transcription chunks completed but returned no text")
         elapsed = time.monotonic() - started
         return result, elapsed
+
+    def _summarize_result(
+        self, record_id: int, row: sqlite3.Row, result: dict[str, Any], digest: str,
+    ) -> str:
+        summary_path = Path(row["summary_path"]) if row["summary_path"] else self.cfg.summaries_dir / f"{digest}.md"
+        if not self.cfg.summary_enabled:
+            self.db.update(record_id, status="summarized")
+            return "_Summary generation was disabled._"
+        if summary_path.exists():
+            return summary_path.read_text(encoding="utf-8").strip()
+        self.db.update(record_id, status="summarizing", failed_stage=None, last_error=None)
+        self.logger.info("Summarizing: %s", row["source_name"])
+        started = time.monotonic()
+        summary = self.summarizer.summarize(
+            timestamped_text(corrected_result(result, self.cfg.corrections))
+        )
+        elapsed = time.monotonic() - started
+        atomic_write(summary_path, summary.strip() + "\n")
+        self.db.update(
+            record_id, status="summarized", summary_path=str(summary_path),
+            summary_model=self.cfg.summary_model, summary_seconds=elapsed,
+        )
+        self.logger.info("Summarized in %.1fs", elapsed)
+        return summary
+
+    def _write_note_and_finalize(
+        self, record_id: int, row: sqlite3.Row, audio_path: Path,
+        digest: str, summary: str, cleaned: str,
+    ) -> Path:
+        recorded = dt.datetime.fromtimestamp(int(row["source_mtime_ns"]) / 1_000_000_000).astimezone()
+        generated_title = row["generated_title"]
+        if self.cfg.generate_title and not generated_title and self.cfg.summary_enabled:
+            generated_title = self.summarizer.title(summary)
+            self.db.update(record_id, generated_title=generated_title)
+        audio_link = ""
+        if self.cfg.copy_audio_to_vault:
+            _, audio_link = copy_audio_attachment(audio_path, self.cfg, digest)
+        descriptive = safe_component(generated_title) if generated_title else safe_component(Path(row["source_name"]).stem)
+        base = f"{recorded:%Y-%m-%d %H-%M-%S}_{descriptive}_{digest[:8]}"
+        note_path = unique_note_path(self.cfg.notes_folder, base, row["note_path"])
+        quality = self._recording_quality(row, audio_path, analyze_missing=False)
+        values = {
+            "date": yaml_string(recorded.date().isoformat()),
+            "time_recorded": yaml_string(recorded.isoformat(timespec="seconds")),
+            "original_file": yaml_string(row["source_name"]),
+            "original_path": yaml_string(row["source_path"]),
+            "file_hash": yaml_string(digest),
+            "duration_seconds": str(round(float(row["duration_seconds"]), 3)) if row["duration_seconds"] else "null",
+            "audio_mean_db": str(round(quality.mean_db, 3)) if quality else "null",
+            "audio_peak_db": str(round(quality.peak_db, 3)) if quality else "null",
+            "audio_active_seconds": str(round(quality.active_seconds, 3)) if quality else "null",
+            "audio_clipping_percent": str(round(quality.clipping_percent, 6)) if quality else "null",
+            "audio_quality_warnings": yaml_string(
+                ", ".join(quality.warnings if quality else audio_quality_warnings(row["audio_quality_json"])) or "none"
+            ),
+            "language": yaml_string(row["detected_language"] or self.cfg.language or "unknown"),
+            "backend": yaml_string(row["backend"] or self.cfg.backend),
+            "model": yaml_string(row["model"] or self.cfg.model),
+            "model_version": yaml_string(row["model_version"] or "unknown"),
+            "transcription_seconds": str(round(float(row["transcribe_seconds"]), 3)) if row["transcribe_seconds"] else "null",
+            "summary_model": yaml_string(row["summary_model"] or (self.cfg.summary_model if self.cfg.summary_enabled else "disabled")),
+            "summary_seconds": str(round(float(row["summary_seconds"]), 3)) if row["summary_seconds"] else "null",
+            "processed_at": yaml_string(dt.datetime.now().astimezone().isoformat(timespec="seconds")),
+            "title_heading": f"# {generated_title}" if generated_title else "",
+            "audio_link": audio_link,
+            "summary": summary.strip(),
+            "transcript": cleaned.strip(),
+        }
+        template = DEFAULT_NOTE_TEMPLATE
+        if self.cfg.note_template:
+            if not self.cfg.note_template.is_file():
+                raise PipelineError(f"Note template not found: {self.cfg.note_template}")
+            template = self.cfg.note_template.read_text(encoding="utf-8")
+        elif not template:
+            raise PipelineError(f"Default note template not found: {DEFAULT_NOTE_TEMPLATE_PATH}")
+        note = render_template(template, values).rstrip() + "\n"
+        if note_path.exists() and note_path.read_text(encoding="utf-8") != note:
+            note_path = unique_note_path(self.cfg.notes_folder, base)
+        atomic_write(note_path, note, mode=0o644)
+        destination_dir = self.cfg.archive_dir if self.cfg.archive_audio else self.cfg.incoming_dir
+        final_audio = move_state_audio(audio_path, destination_dir, digest) if audio_path.parent != destination_dir else audio_path
+        self.db.update(
+            record_id, status="completed", local_path=str(final_audio), note_path=str(note_path),
+            completed_at=now_iso(), failed_stage=None, last_error=None,
+        )
+        self.logger.info("Complete: %s → %s", row["source_name"], note_path.name)
+        return note_path
 
     def process_record(self, record_id: int) -> str:
         row = self.db.get(record_id)
@@ -1556,11 +2096,43 @@ class Pipeline:
                                backend=self.cfg.backend, model=self.cfg.model)
                 self.logger.info("Transcribing: %s", row["source_name"])
                 result, elapsed = self._transcribe_record(row, audio_path)
-                backend_name = self.transcriber.backend if self.transcriber else (row["backend"] or self.cfg.backend)
-                model_version = self.transcriber.version() if self.transcriber else (row["model_version"] or "unknown")
+                model_used = self.cfg.model
                 raw = result["text"].strip()
                 if not raw:
-                    raise PipelineError("Transcription returned no text")
+                    current = self.db.get(record_id)
+                    quality = self._recording_quality(current, audio_path)
+                    if quality is not None:
+                        self.logger.info(
+                            "Blank recording signal: mean %.1f dB, peak %.1f dB, active %.2fs",
+                            quality.mean_db, quality.peak_db, quality.active_seconds,
+                        )
+                    if quality is not None and quality.is_silent(self.cfg):
+                        backend_name = self.transcriber.backend if self.transcriber else (row["backend"] or self.cfg.backend)
+                        model_version = self.transcriber.version() if self.transcriber else (row["model_version"] or "unknown")
+                        self._release_transcriber()
+                        destination_dir = self.cfg.archive_dir if self.cfg.archive_audio else self.cfg.incoming_dir
+                        final_audio = move_state_audio(audio_path, destination_dir, digest)
+                        duration = ffprobe_duration(final_audio)
+                        self.db.update(
+                            record_id, status="no_speech", local_path=str(final_audio), failed_stage=None,
+                            last_error=None, backend=backend_name, model=model_used,
+                            model_version=model_version, duration_seconds=duration,
+                            transcribe_seconds=elapsed, completed_at=now_iso(),
+                        )
+                        self.logger.info(
+                            "No speech detected: %s (peak %.1f dB, active %.2fs); audio preserved",
+                            row["source_name"], quality.peak_db, quality.active_seconds,
+                        )
+                        return "no_speech"
+                    result, retry_elapsed, model_used = self._retry_blank_transcript(
+                        self.db.get(record_id), audio_path,
+                    )
+                    elapsed += retry_elapsed
+                    raw = result["text"].strip()
+                    if not raw:
+                        raise NeedsReviewError("Transcription returned no text after one enhanced retry")
+                backend_name = self.transcriber.backend if self.transcriber else (row["backend"] or self.cfg.backend)
+                model_version = self.transcriber.version() if self.transcriber else (row["model_version"] or "unknown")
                 cleaned = apply_corrections(raw, self.cfg.corrections)
                 atomic_write(transcript_path, raw + "\n")
                 atomic_write(cleaned_path, cleaned + "\n")
@@ -1569,7 +2141,7 @@ class Pipeline:
                 self.db.update(record_id, status="transcribed", transcript_path=str(transcript_path),
                                cleaned_transcript_path=str(cleaned_path), segments_path=str(segments_path),
                                detected_language=result.get("language"), backend=backend_name,
-                               model=self.cfg.model, model_version=model_version,
+                               model=model_used, model_version=model_version,
                                duration_seconds=duration, transcribe_seconds=elapsed)
                 self.logger.info("Transcribed in %.1fs", elapsed)
             else:
@@ -1581,85 +2153,31 @@ class Pipeline:
             self._release_transcriber()
             stage = "summary"
             summary_path = Path(row["summary_path"]) if row["summary_path"] else self.cfg.summaries_dir / f"{digest}.md"
-            summary = "_Summary generation was disabled._"
-            if self.cfg.summary_enabled:
-                if not summary_path.exists():
-                    self.db.update(record_id, status="summarizing", failed_stage=None, last_error=None)
-                    self.logger.info("Summarizing: %s", row["source_name"])
-                    started = time.monotonic()
-                    summary_model_touched = True
-                    summary = self.summarizer.summarize(timestamped_text(corrected_result(result, self.cfg.corrections)))
-                    elapsed = time.monotonic() - started
-                    atomic_write(summary_path, summary.strip() + "\n")
-                    self.db.update(record_id, status="summarized", summary_path=str(summary_path),
-                                   summary_model=self.cfg.summary_model, summary_seconds=elapsed)
-                    self.logger.info("Summarized in %.1fs", elapsed)
-                else:
-                    summary = summary_path.read_text(encoding="utf-8").strip()
-            else:
-                self.db.update(record_id, status="summarized")
-
+            summary_model_touched = self.cfg.summary_enabled and not summary_path.exists()
+            summary = self._summarize_result(record_id, row, result, digest)
             row = self.db.get(record_id)
             stage = "note"
             self.db.update(record_id, status="writing", failed_stage=None, last_error=None)
-            recorded = dt.datetime.fromtimestamp(int(row["source_mtime_ns"]) / 1_000_000_000).astimezone()
-            generated_title = row["generated_title"]
-            if self.cfg.generate_title and not generated_title and self.cfg.summary_enabled:
-                summary_model_touched = True
-                generated_title = self.summarizer.title(summary)
-                self.db.update(record_id, generated_title=generated_title)
-            audio_link = ""
-            if self.cfg.copy_audio_to_vault:
-                _, audio_link = copy_audio_attachment(audio_path, self.cfg, digest)
-            descriptive = safe_component(generated_title) if generated_title else safe_component(Path(row["source_name"]).stem)
-            base = f"{recorded:%Y-%m-%d %H-%M-%S}_{descriptive}_{digest[:8]}"
-            note_path = unique_note_path(self.cfg.notes_folder, base, row["note_path"])
-            values = {
-                "date": yaml_string(recorded.date().isoformat()),
-                "time_recorded": yaml_string(recorded.isoformat(timespec="seconds")),
-                "original_file": yaml_string(row["source_name"]),
-                "original_path": yaml_string(row["source_path"]),
-                "file_hash": yaml_string(digest),
-                "duration_seconds": str(round(float(row["duration_seconds"]), 3)) if row["duration_seconds"] else "null",
-                "language": yaml_string(row["detected_language"] or self.cfg.language or "unknown"),
-                "backend": yaml_string(row["backend"] or self.cfg.backend),
-                "model": yaml_string(row["model"] or self.cfg.model),
-                "model_version": yaml_string(row["model_version"] or "unknown"),
-                "transcription_seconds": str(round(float(row["transcribe_seconds"]), 3)) if row["transcribe_seconds"] else "null",
-                "summary_model": yaml_string(row["summary_model"] or (self.cfg.summary_model if self.cfg.summary_enabled else "disabled")),
-                "summary_seconds": str(round(float(row["summary_seconds"]), 3)) if row["summary_seconds"] else "null",
-                "processed_at": yaml_string(dt.datetime.now().astimezone().isoformat(timespec="seconds")),
-                "title_heading": f"# {generated_title}" if generated_title else "",
-                "audio_link": audio_link,
-                "summary": summary.strip(),
-                "transcript": cleaned.strip(),
-            }
-            template = DEFAULT_NOTE_TEMPLATE
-            if self.cfg.note_template:
-                if not self.cfg.note_template.is_file():
-                    raise PipelineError(f"Note template not found: {self.cfg.note_template}")
-                template = self.cfg.note_template.read_text(encoding="utf-8")
-            note = render_template(template, values).rstrip() + "\n"
-            if note_path.exists():
-                existing = note_path.read_text(encoding="utf-8")
-                if existing != note:
-                    note_path = unique_note_path(self.cfg.notes_folder, base)
-            atomic_write(note_path, note, mode=0o644)
-            destination_dir = self.cfg.archive_dir if self.cfg.archive_audio else self.cfg.incoming_dir
-            final_audio = move_state_audio(audio_path, destination_dir, digest) if audio_path.parent != destination_dir else audio_path
-            self.db.update(record_id, status="completed", local_path=str(final_audio), note_path=str(note_path),
-                           completed_at=now_iso(), failed_stage=None, last_error=None)
-            self.logger.info("Complete: %s → %s", row["source_name"], note_path.name)
+            summary_model_touched |= bool(
+                self.cfg.generate_title and not row["generated_title"] and self.cfg.summary_enabled
+            )
+            self._write_note_and_finalize(record_id, row, audio_path, digest, summary, cleaned)
             return "completed"
         except Exception as exc:
             failed_audio = audio_path
             if audio_path.exists() and audio_path.parent == self.cfg.processing_dir:
                 with contextlib.suppress(Exception):
                     failed_audio = move_state_audio(audio_path, self.cfg.failed_dir, digest)
-            self.db.update(record_id, status="failed", failed_stage=stage, last_error=str(exc), local_path=str(failed_audio))
-            self.logger.exception("%s failed for %s: %s", stage.capitalize(), row["source_name"], exc)
-            notify_error(f"{stage.capitalize()} failed for {row['source_name']}: {exc}", self.cfg)
-            return "failed"
+            needs_review = isinstance(exc, NeedsReviewError)
+            status = "needs_review" if needs_review else "failed"
+            self.db.update(record_id, status=status, failed_stage=stage, last_error=str(exc), local_path=str(failed_audio))
+            if needs_review:
+                self.logger.error("Transcription needs review for %s: %s", row["source_name"], exc)
+                notify_error(f"Transcription needs review for {row['source_name']}: {exc}", self.cfg)
+            else:
+                self.logger.exception("%s failed for %s: %s", stage.capitalize(), row["source_name"], exc)
+                notify_error(f"{stage.capitalize()} failed for {row['source_name']}: {exc}", self.cfg)
+            return status
         finally:
             self._release_transcriber()
             if summary_model_touched:
@@ -1681,7 +2199,10 @@ class Pipeline:
         for index, row in enumerate(rows, 1):
             self.logger.info("Processing %d/%d", index, len(rows))
             result = self.process_record(int(row["id"]))
-            counts[result if result in counts else "failed"] += 1
+            if result == "no_speech":
+                counts["no_speech"] = counts.get("no_speech", 0) + 1
+            else:
+                counts[result if result in counts else "failed"] += 1
         return counts
 
 
@@ -1722,10 +2243,12 @@ def notify_new_recordings(count: int, cfg: Config) -> None:
     notify("Auto Transcription", f"Transcribing {count} new {noun}", cfg.notify)
 
 
-def notify_finished(completed: int, failed: int, cfg: Config) -> None:
-    if completed <= 0 and failed <= 0:
+def notify_finished(completed: int, failed: int, cfg: Config, no_speech: int = 0) -> None:
+    if completed <= 0 and failed <= 0 and no_speech <= 0:
         return
     message = f"Finished: {completed} completed"
+    if no_speech:
+        message += f", {no_speech} contained no speech"
     if failed:
         message += f", {failed} failed"
     notify("Auto Transcription", message, cfg.notify)
@@ -1778,11 +2301,8 @@ def check_dependencies(cfg: Config, logger: logging.Logger) -> bool:
         ok = False
     if cfg.summary_enabled and cfg.summary_model != "mock":
         try:
-            with urllib.request.urlopen(cfg.ollama_url.rstrip("/") + "/api/tags", timeout=5) as response:
-                tags = json.loads(response.read().decode("utf-8"))
-            names = {item.get("name", "").split(":")[0] for item in tags.get("models", [])}
             wanted = cfg.summary_model.split(":")[0]
-            installed = wanted in names
+            installed = wanted in ollama_model_names(cfg)
             logger.info("Ollama model: %s (%s)", cfg.summary_model, "installed" if installed else "MISSING")
             ok &= installed
         except Exception as exc:
@@ -1797,16 +2317,65 @@ def check_dependencies(cfg: Config, logger: logging.Logger) -> bool:
     return bool(ok)
 
 
+def doctor(cfg: Config, db: StateDB, logger: logging.Logger) -> bool:
+    ok = check_dependencies(cfg, logger)
+    integrity_ok, detail = db.integrity_check()
+    logger.info("Database:    %s (%s)", "healthy" if integrity_ok else "CORRUPT", detail)
+    ok &= integrity_ok
+
+    free = shutil.disk_usage(cfg.state_root).free
+    logger.info("Free space:  %.1f GB", free / (1024 ** 3))
+    if free < 5 * 1024 ** 3:
+        logger.error("At least 5 GB of free space is recommended")
+        ok = False
+
+    if cfg.recorder_folder.is_dir():
+        try:
+            identity = verify_recorder_identity(cfg, db, logger)
+            logger.info("Recorder ID: %s", identity.uuid if identity else "not enforced for this path")
+        except PipelineError as exc:
+            logger.error("Recorder ID: FAILED (%s)", exc)
+            ok = False
+    else:
+        logger.info("Recorder ID: unavailable while recorder is not mounted")
+
+    if platform.system() == "Darwin":
+        plist = Path.home() / "Library" / "LaunchAgents" / "local.auto-transcription.plist"
+        service = f"gui/{os.getuid()}/local.auto-transcription"
+        loaded = subprocess.run(
+            ["/bin/launchctl", "print", service], text=True, capture_output=True,
+            timeout=20, check=False,
+        )
+        plist_ok = plist.is_file()
+        logger.info("LaunchAgent: %s, %s", "installed" if plist_ok else "MISSING",
+                    "loaded" if loaded.returncode == 0 else "NOT LOADED")
+        ok &= plist_ok and loaded.returncode == 0
+
+    unresolved = list(db.conn.execute(
+        "SELECT source_name,status,last_error,next_retry_at FROM recordings "
+        "WHERE status IN ('failed','needs_review') ORDER BY updated_at DESC LIMIT 5"
+    ))
+    if unresolved:
+        logger.warning("Unresolved recordings: %d shown", len(unresolved))
+        for row in unresolved:
+            suffix = f"; retry after {row['next_retry_at']}" if row["next_retry_at"] else ""
+            logger.warning("  %s [%s]: %s%s", row["source_name"], row["status"], row["last_error"], suffix)
+    else:
+        logger.info("Unresolved:  none")
+    maintenance = maintain_state(cfg, db, logger, dry_run=True)
+    logger.info("Maintenance:  %d removable state item(s)", sum(maintenance.values()))
+    return bool(ok)
+
+
 def prepare_dependencies(cfg: Config, logger: logging.Logger) -> None:
     transcriber = Transcriber(cfg, logger)
     transcriber.prepare_models()
     if cfg.summary_enabled and cfg.summary_model != "mock":
+        ensure_ollama_running(cfg, logger)
         try:
-            with urllib.request.urlopen(cfg.ollama_url.rstrip("/") + "/api/tags", timeout=5) as response:
-                tags = json.loads(response.read().decode("utf-8"))
+            names = ollama_model_names(cfg)
         except Exception as exc:
             raise PipelineError(f"Ollama is unavailable: {exc}") from exc
-        names = {item.get("name", "").split(":")[0] for item in tags.get("models", [])}
         if cfg.summary_model.split(":")[0] not in names:
             if shutil.which("ollama") is None:
                 raise PipelineError(f"Ollama model is missing: {cfg.summary_model}")
@@ -1825,9 +2394,31 @@ def reset_failed(db: StateDB, logger: logging.Logger) -> int:
             status = "ready"
         else:
             status = "detected"
-        db.update(int(row["id"]), status=status, failed_stage=None, last_error=None)
+        db.update(int(row["id"]), status=status, failed_stage=None, last_error=None,
+                  next_retry_at=None, consecutive_failures=0)
     logger.info("Reset %d failed recording(s)", len(rows))
     return len(rows)
+
+
+def ignore_known_macos_metadata(db: StateDB, logger: logging.Logger) -> int:
+    """Migrate previously imported Apple metadata into a terminal state."""
+    rows = list(db.conn.execute(
+        """SELECT * FROM recordings
+           WHERE status NOT IN ('completed','duplicate','ignored')"""
+    ))
+    ignored = 0
+    for row in rows:
+        paths = [Path(value) for value in (row["local_path"], row["source_path"]) if value]
+        if not any(path.is_file() and is_macos_metadata_file(path) for path in paths):
+            continue
+        db.update(
+            int(row["id"]), status="ignored", failed_stage=None,
+            last_error="Ignored macOS AppleSingle/AppleDouble metadata file",
+            completed_at=now_iso(),
+        )
+        logger.info("Ignored macOS metadata file: %s", row["source_name"])
+        ignored += 1
+    return ignored
 
 
 def recover_interrupted(db: StateDB, cfg: Config, logger: logging.Logger) -> int:
@@ -1863,6 +2454,7 @@ def reset_for_reprocess(db: StateDB, hash_prefix: str, logger: logging.Logger) -
     db.update(int(row["id"]), status="ready", failed_stage=None, last_error=None,
               transcript_path=None, cleaned_transcript_path=None, segments_path=None,
               summary_path=None, note_path=None, completed_at=None,
+              no_text_retries=0, next_retry_at=None, consecutive_failures=0,
               transcription_generation=int(row["transcription_generation"] or 0) + 1)
     logger.info("Queued for reprocessing: %s", row["source_name"])
     return int(row["id"])
@@ -1923,36 +2515,125 @@ def cleanup_archives(cfg: Config, db: StateDB, days: int, dry_run: bool, logger:
     return removed
 
 
+def maintain_state(
+    cfg: Config, db: StateDB, logger: logging.Logger, dry_run: bool = False,
+    prune_model_cache: bool = False,
+) -> dict[str, int]:
+    """Remove only reproducible or explicitly expired application-state files."""
+    counts = {"chunks": 0, "partials": 0, "metadata": 0, "orphans": 0,
+              "failed_audio": 0, "model_cache": 0}
+    now = time.time()
+    orphan_cutoff = now - max(0, cfg.orphan_retention_days) * 86400
+
+    terminal_hashes = {
+        str(row[0]) for row in db.conn.execute(
+            "SELECT sha256 FROM recordings WHERE status IN ('completed','no_speech','ignored','needs_review') AND sha256 IS NOT NULL"
+        )
+    }
+    for digest in terminal_hashes:
+        directory = cfg.chunks_dir / digest
+        if directory.is_dir() and directory.parent == cfg.chunks_dir:
+            if not dry_run:
+                shutil.rmtree(directory)
+            counts["chunks"] += 1
+
+    for partial in cfg.state_root.rglob("*.partial"):
+        try:
+            if partial.is_file() and partial.stat().st_mtime < now - 86400:
+                if not dry_run:
+                    partial.unlink()
+                counts["partials"] += 1
+        except OSError:
+            continue
+
+    ignored_rows = list(db.conn.execute(
+        "SELECT id,local_path FROM recordings WHERE status='ignored' AND local_path IS NOT NULL"
+    ))
+    for row in ignored_rows:
+        path = Path(row["local_path"])
+        try:
+            within_state = cfg.state_root.resolve() in path.resolve().parents
+        except OSError:
+            within_state = False
+        if within_state and path.is_file() and is_macos_metadata_file(path):
+            if not dry_run:
+                path.unlink()
+                db.update(int(row["id"]), local_path=None)
+            counts["metadata"] += 1
+
+    referenced = {
+        str(Path(value).resolve())
+        for row in db.conn.execute(
+            "SELECT transcript_path,cleaned_transcript_path,segments_path,summary_path FROM recordings"
+        )
+        for value in row if value
+    }
+    for directory in (cfg.transcripts_dir, cfg.summaries_dir):
+        for path in directory.iterdir() if directory.is_dir() else ():
+            try:
+                if (path.is_file() and str(path.resolve()) not in referenced and
+                        path.stat().st_mtime < orphan_cutoff):
+                    if not dry_run:
+                        path.unlink()
+                    counts["orphans"] += 1
+            except OSError:
+                continue
+
+    if cfg.failed_retention_days > 0:
+        cutoff_iso = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=cfg.failed_retention_days)).isoformat()
+        rows = list(db.conn.execute(
+            """SELECT id,local_path FROM recordings
+               WHERE status IN ('failed','needs_review') AND local_path IS NOT NULL AND updated_at < ?""",
+            (cutoff_iso,),
+        ))
+        for row in rows:
+            path = Path(row["local_path"])
+            if path.parent != cfg.failed_dir or not path.is_file():
+                continue
+            if not dry_run:
+                path.unlink()
+                db.update(int(row["id"]), local_path=None)
+            counts["failed_audio"] += 1
+
+    if prune_model_cache:
+        cache = Path.home() / ".cache" / "huggingface" / "hub"
+        keep_repositories = {
+            Transcriber.mlx_model_name(model).replace("/", "--")
+            for model in {cfg.model, cfg.no_text_retry_model, cfg.retry_model}
+        }
+        for directory in cache.glob("models--mlx-community--whisper-*") if cache.is_dir() else ():
+            repository = directory.name.removeprefix("models--")
+            if repository in keep_repositories or not directory.is_dir():
+                continue
+            if not dry_run:
+                shutil.rmtree(directory)
+            counts["model_cache"] += 1
+
+    total = sum(counts.values())
+    if total:
+        logger.info("State maintenance%s: %s", " (dry run)" if dry_run else "", counts)
+    return counts
+
+
 def launchd_plist(cfg: Config, interval: int, script: Path, config_path: Path | None) -> str:
     args = [sys.executable, str(script)]
     if config_path:
         args += ["--config", str(config_path)]
     args += ["--quiet", "run"]
-    xml_args = "\n".join(f"        <string>{xml_escape(value)}</string>" for value in args)
-    return f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key><string>local.auto-transcription</string>
-    <key>ProgramArguments</key>
-    <array>
-{xml_args}
-    </array>
-    <key>StartOnMount</key><true/>
-    <key>StartInterval</key><integer>{interval}</integer>
-    <key>RunAtLoad</key><true/>
-    <key>Nice</key><integer>20</integer>
-    <key>ProcessType</key><string>Background</string>
-    <key>LowPriorityIO</key><true/>
-    <key>StandardOutPath</key><string>{xml_escape(str(cfg.log_path))}</string>
-    <key>StandardErrorPath</key><string>{xml_escape(str(cfg.log_path))}</string>
-</dict>
-</plist>
-"""
-
-
-def xml_escape(value: str) -> str:
-    return value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+    data = {
+        "Label": "local.auto-transcription",
+        "ProgramArguments": args,
+        "EnvironmentVariables": {"PATH": LAUNCHD_PATH},
+        "StartOnMount": True,
+        "StartInterval": interval,
+        "RunAtLoad": True,
+        "Nice": 20,
+        "ProcessType": "Background",
+        "LowPriorityIO": True,
+        "StandardOutPath": str(cfg.log_path),
+        "StandardErrorPath": str(cfg.log_path),
+    }
+    return plistlib.dumps(data, fmt=plistlib.FMT_XML, sort_keys=False).decode("utf-8")
 
 
 def install_launchd(
@@ -2004,6 +2685,23 @@ def activate_launchd(plist: Path, logger: logging.Logger) -> None:
     logger.info("Installed and activated mount automation: %s", service)
 
 
+def uninstall_launchd(logger: logging.Logger) -> bool:
+    if platform.system() != "Darwin":
+        raise PipelineError("--uninstall is available only on macOS")
+    plist = Path.home() / "Library" / "LaunchAgents" / "local.auto-transcription.plist"
+    service = f"gui/{os.getuid()}/local.auto-transcription"
+    subprocess.run(
+        ["/bin/launchctl", "bootout", service], text=True, capture_output=True,
+        timeout=30, check=False,
+    )
+    removed = False
+    if plist.is_file():
+        plist.unlink()
+        removed = True
+    logger.info("Automatic recorder processing %s", "uninstalled" if removed else "was not installed")
+    return removed
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--version", action="version", version=APP_VERSION)
@@ -2018,6 +2716,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--install", action="store_true",
         help="install and activate automatic run-on-mount behavior, then exit",
+    )
+    parser.add_argument(
+        "--uninstall", action="store_true",
+        help="remove automatic run-on-mount behavior without deleting application data",
     )
     parser.add_argument("--backend", choices=("auto", "mlx", "openai", "cli", "mock"))
     parser.add_argument("--model")
@@ -2049,7 +2751,19 @@ def build_parser() -> argparse.ArgumentParser:
     cleanup.add_argument("--older-than-days", type=int, required=True)
     cleanup.add_argument("--dry-run", action="store_true")
     sub.add_parser("check", help="Validate dependencies and configuration")
+    sub.add_parser("doctor", help="Run comprehensive dependency, state, database, and automation diagnostics")
     sub.add_parser("prepare", help="Download and warm the configured local models")
+    maintenance = sub.add_parser("maintenance", help="Clean safe generated state and expired files")
+    maintenance.add_argument("--dry-run", action="store_true")
+    maintenance.add_argument(
+        "--prune-model-cache", action="store_true",
+        help="also remove cached MLX Whisper repositories not configured by this application",
+    )
+    database = sub.add_parser("database", help="Check, backup, export, or repair the state database")
+    database.add_argument("action", choices=("check", "backup", "export", "repair"))
+    database.add_argument("--output", type=Path)
+    runs = sub.add_parser("runs", help="Show recent pipeline run history")
+    runs.add_argument("--limit", type=int, default=20)
     launchd = sub.add_parser("install-launchd", help="Write a run-on-mount LaunchAgent without loading it")
     launchd.add_argument("--output")
     launchd.add_argument("--interval", type=int, default=60)
@@ -2068,16 +2782,109 @@ def print_status(db: StateDB, limit: int) -> None:
         print(f"  {row['id']:4} {row['status']:12} {digest} {row['source_name']}{error}")
 
 
+def print_runs(db: StateDB, limit: int) -> None:
+    print("Recent runs:")
+    rows = db.conn.execute("SELECT * FROM runs ORDER BY id DESC LIMIT ?", (max(1, limit),))
+    for row in rows:
+        finished = row["finished_at"] or "running"
+        print(
+            f"  {row['id']:4} {row['status']:10} {row['command']:10} {row['started_at']} -> {finished} "
+            f"found={row['found']} imported={row['imported']} completed={row['completed']} "
+            f"silent={row['no_speech']} failed={row['failed']} unmounted={row['unmounted']}"
+        )
+
+
+def database_command(db: StateDB, action: str, output: Path | None) -> int:
+    if action == "check":
+        ok, detail = db.integrity_check()
+        print(f"Database integrity: {detail}")
+        return 0 if ok else 1
+    if action == "backup":
+        path = db.create_backup("manual", output.resolve() if output else None)
+        print(f"Database backup: {path}")
+        return 0
+    if action == "export":
+        if output is None:
+            raise PipelineError("database export requires --output")
+        print(f"Database export: {db.export_sql(output)}")
+        return 0
+    ok, detail, backup = db.repair()
+    print(f"Pre-repair backup: {backup}")
+    print(f"Database integrity after repair: {detail}")
+    return 0 if ok else 1
+
+
+def execute_pipeline_command(
+    command: str, args: argparse.Namespace, pipeline: Pipeline,
+    cfg: Config, db: StateDB, logger: logging.Logger,
+) -> int:
+    """Execute import/process/run/retry with one run-history and cleanup lifecycle."""
+    run_id = db.start_run(command, cfg, db.metadata_get("recorder_volume_uuid"))
+    metrics: dict[str, Any] = {}
+    try:
+        if command == "import":
+            imported = pipeline.import_new(args.dry_run)
+            metrics.update(
+                found=imported["found"], imported=imported["ready"] + imported["duplicate"],
+                failed=imported["failed"],
+            )
+            failed = imported["failed"]
+            db.finish_run(run_id, "failed" if failed else "completed", metrics)
+            return 1 if failed else 0
+
+        imported = {"found": 0, "ready": 0, "duplicate": 0, "failed": 0}
+        if command in {"run", "retry"}:
+            if command == "retry":
+                reset_failed(db, logger)
+            imported = pipeline.import_new(
+                getattr(args, "dry_run", False), missing_ok=True,
+            )
+            metrics.update(
+                found=imported["found"], imported=imported["ready"] + imported["duplicate"],
+                failed=imported["failed"],
+            )
+            if command == "run" and args.dry_run:
+                db.finish_run(run_id, "dry-run", metrics)
+                return 0
+            notify_new_recordings(imported["ready"], cfg)
+
+        with prevent_sleep(cfg.prevent_sleep):
+            processed = pipeline.process_pending(
+                getattr(args, "include_failed", False) if command == "process" else False,
+            )
+        total_failed = imported["failed"] + processed["failed"]
+        metrics.update(
+            completed=processed["completed"], no_speech=processed.get("no_speech", 0),
+            failed=total_failed,
+        )
+        if not cfg.keep_audio and cfg.discard_after_days > 0:
+            cleanup_archives(cfg, db, cfg.discard_after_days, False, logger)
+        if command == "run" and imported["found"] > 0 and not total_failed:
+            metrics["unmounted"] = unmount_recorder(cfg, logger)
+        elif command == "run" and imported["found"] == 0:
+            logger.debug("Leaving recorder mounted because this run found no new files")
+        maintain_state(cfg, db, logger)
+        notify_finished(
+            processed["completed"], total_failed, cfg,
+            no_speech=processed.get("no_speech", 0),
+        )
+        db.finish_run(run_id, "failed" if total_failed else "completed", metrics)
+        return 1 if total_failed else 0
+    except Exception as exc:
+        db.finish_run(run_id, "error", metrics, str(exc))
+        raise
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    standalone_count = int(args.reset_state) + int(args.install)
+    standalone_count = int(args.reset_state) + int(args.install) + int(args.uninstall)
     if standalone_count > 1:
-        parser.error("--install and --reset-state cannot be combined")
+        parser.error("--install, --uninstall, and --reset-state cannot be combined")
     if standalone_count and args.command:
         parser.error("standalone options cannot be combined with a command")
     if not standalone_count and not args.command:
-        parser.error("a command, --install, or --reset-state is required")
+        parser.error("a command, --install, --uninstall, or --reset-state is required")
     cfg: Config | None = None
     try:
         cfg = apply_overrides(load_config(args.config), args)
@@ -2102,22 +2909,34 @@ def main(argv: Sequence[str] | None = None) -> int:
             activate_launchd(plist, logger)
             print(f"Automatic recorder mount processing installed: {plist}")
             return 0
-        with StateDB(cfg.db_path) as db:
-            db.migrate_legacy_hashes(cfg.vault / ".processed_hashes", logger)
+        if args.uninstall:
+            removed = uninstall_launchd(logger)
+            print("Automatic recorder mount processing uninstalled" if removed else "Automatic recorder mount processing was not installed")
+            return 0
+        with StateDB(cfg.db_path, cfg.database_backups) as db:
             command = args.command
             if command == "status":
                 print_status(db, args.limit)
+                return 0
+            if command == "runs":
+                print_runs(db, args.limit)
                 return 0
             if command == "check":
                 ok = check_dependencies(cfg, logger)
                 if not ok:
                     notify_error("Dependency check failed; see the transcription log for details", cfg)
                 return 0 if ok else 1
+            if command == "doctor":
+                return 0 if doctor(cfg, db, logger) else 1
+            if command == "database":
+                with PipelineLock(cfg.lock_dir):
+                    return database_command(db, args.action, args.output)
             if command == "prepare":
                 prepare_dependencies(cfg, logger)
                 return 0
             if command == "scan":
-                candidates = scan_recorder(cfg, db)
+                identity = verify_recorder_identity(cfg, db, logger)
+                candidates = scan_recorder(cfg, db, identity.uuid if identity else None)
                 for candidate in candidates:
                     print(f"{candidate.stat.st_size:12}  {candidate.path}")
                 print(f"{len(candidates)} new recording(s)")
@@ -2127,54 +2946,29 @@ def main(argv: Sequence[str] | None = None) -> int:
                 return 0
             with PipelineLock(cfg.lock_dir):
                 recover_interrupted(db, cfg, logger)
+                ignore_known_macos_metadata(db, logger)
                 pipeline = Pipeline(cfg, db, logger)
-                if command == "import":
-                    result = pipeline.import_new(args.dry_run)
-                    return 1 if result["failed"] else 0
-                if command == "process":
-                    with prevent_sleep(cfg.prevent_sleep):
-                        result = pipeline.process_pending(args.include_failed)
-                    if not cfg.keep_audio and cfg.discard_after_days > 0:
-                        cleanup_archives(cfg, db, cfg.discard_after_days, False, logger)
-                    notify_finished(result["completed"], result["failed"], cfg)
-                    return 1 if result["failed"] else 0
-                if command == "run":
-                    imported = pipeline.import_new(args.dry_run, missing_ok=True)
-                    if args.dry_run:
-                        return 0
-                    notify_new_recordings(imported["ready"], cfg)
-                    with prevent_sleep(cfg.prevent_sleep):
-                        processed = pipeline.process_pending()
-                    if not cfg.keep_audio and cfg.discard_after_days > 0:
-                        cleanup_archives(cfg, db, cfg.discard_after_days, False, logger)
-                    total_failed = imported["failed"] + processed["failed"]
-                    if total_failed:
-                        notify_finished(processed["completed"], total_failed, cfg)
-                        return 1
-                    unmount_recorder(cfg, logger)
-                    notify_finished(processed["completed"], 0, cfg)
-                    return 0
-                if command == "retry":
-                    reset_failed(db, logger)
-                    imported = pipeline.import_new(missing_ok=True)
-                    notify_new_recordings(imported["ready"], cfg)
-                    with prevent_sleep(cfg.prevent_sleep):
-                        result = pipeline.process_pending()
-                    if not cfg.keep_audio and cfg.discard_after_days > 0:
-                        cleanup_archives(cfg, db, cfg.discard_after_days, False, logger)
-                    total_failed = imported["failed"] + result["failed"]
-                    notify_finished(result["completed"], total_failed, cfg)
-                    return 1 if total_failed else 0
+                if command in {"import", "process", "run", "retry"}:
+                    return execute_pipeline_command(command, args, pipeline, cfg, db, logger)
                 if command == "reprocess":
                     record_id = reset_for_reprocess(db, args.hash_prefix, logger)
                     with prevent_sleep(cfg.prevent_sleep):
-                        completed = pipeline.process_record(record_id) == "completed"
-                    if completed and not cfg.keep_audio and cfg.discard_after_days > 0:
+                        outcome = pipeline.process_record(record_id)
+                    successful = outcome in {"completed", "no_speech"}
+                    if successful and not cfg.keep_audio and cfg.discard_after_days > 0:
                         cleanup_archives(cfg, db, cfg.discard_after_days, False, logger)
-                    notify_finished(1 if completed else 0, 0 if completed else 1, cfg)
-                    return 0 if completed else 1
+                    notify_finished(
+                        1 if outcome == "completed" else 0,
+                        0 if successful else 1,
+                        cfg,
+                        no_speech=1 if outcome == "no_speech" else 0,
+                    )
+                    return 0 if successful else 1
                 if command == "cleanup":
                     cleanup_archives(cfg, db, args.older_than_days, args.dry_run, logger)
+                    return 0
+                if command == "maintenance":
+                    maintain_state(cfg, db, logger, args.dry_run, args.prune_model_cache)
                     return 0
         parser.error(f"Unhandled command: {args.command}")
     except PipelineError as exc:

@@ -50,12 +50,17 @@ For complete CLI control, use `auto_transcription.py` directly. Global options c
 - `cleanup --older-than-days N --dry-run`: preview archive cleanup.
 - `cleanup --older-than-days N`: remove old archived audio while retaining notes and transcripts.
 - `check`: validate FFmpeg, the transcription backend, Ollama, and configured paths.
+- `doctor`: check dependencies, disk space, database integrity, recorder identity, the LaunchAgent, unresolved recordings, and safe-cleanup candidates.
 - `prepare`: download and warm the configured transcription and Ollama models.
+- `maintenance --dry-run`: preview removal of reproducible chunks, stale partial copies, confirmed macOS metadata, and old orphaned generated files. Add `--prune-model-cache` to explicitly include unused MLX Whisper model repositories.
+- `database check|backup|repair`: inspect or maintain SQLite state; `database export --output FILE` creates a readable SQL export.
+- `runs`: show recent run results, work counts, peak memory, and whether that run unmounted the recorder.
 - `install-launchd`: write the run-on-mount LaunchAgent without loading it.
 - `--install`: install and immediately activate a low-priority LaunchAgent with `StartOnMount`, `RunAtLoad`, and a 60-second fallback check. No manual plist editing or `launchctl` command is required.
+- `--uninstall`: unload and remove the LaunchAgent while preserving recordings, notes, configuration, and application state.
 - `--reset-state`: delete the configured application state directory and exit. This removes staged audio, the database, chunk checkpoints, transcripts, summaries, and logs; recorder files and Obsidian notes are not touched.
 
-The default profile uses Whisper `small` without a large-model retry, keeping memory use and processing time substantially lower on a 16 GB Mac. The Python pipeline runs at nice level 20, macOS's lowest CPU scheduling priority, and all spawned FFmpeg, ffprobe, Whisper CLI, and helper processes inherit it. When summarization is enabled, the pipeline probes the local Ollama API before loading Whisper; if needed, it starts a detached, low-priority `ollama serve` and waits for readiness. Notifications report how many newly imported recordings are about to be transcribed, a final completed/failed summary when actual work finishes, and immediate errors; empty successful polls stay quiet. After a non-dry-run `run` completes with zero failures, the configured recorder volume is unmounted with `diskutil unmount` so it is safe to disconnect. Use `--maximum-accuracy` only when you explicitly want `large-v3` and can accept its much higher memory pressure. You can also use `--language auto` for automatic language detection and `--no-summary`, `--no-vad`, or `--no-notify` to disable individual stages.
+The default profile uses Whisper `small` without a large-model retry, keeping memory use and processing time substantially lower on a 16 GB Mac. The Python pipeline runs at nice level 20, macOS's lowest CPU scheduling priority, and all spawned FFmpeg, ffprobe, Whisper CLI, and helper processes inherit it. When summarization is enabled, the pipeline probes the local Ollama API before loading Whisper; if needed, it starts a detached, low-priority `ollama serve` and waits for readiness. Notifications report how many newly imported recordings are about to be transcribed, a final completed/failed summary when actual work finishes, and immediate errors; empty successful polls stay quiet. After a non-dry-run `run` finds new recorder files and completes with zero failures, that same run unmounts the configured recorder volume with `diskutil unmount`; a later empty poll can never unmount it on behalf of earlier work. Use `--maximum-accuracy` only when you explicitly want `large-v3` and can accept its much higher memory pressure. You can also use `--language auto` for automatic language detection and `--no-summary`, `--no-vad`, or `--no-notify` to disable individual stages.
 
 ## Configuration
 
@@ -69,7 +74,9 @@ Alternatively, pass `--config /path/to/config.toml`.
 
 The configuration controls paths, language, model selection, confidence retry, bounded audio chunking, silence-aware voice detection, optional FFmpeg filtering, Ollama prompts, correction terms, audio retention, templates, notifications, and timeouts.
 
-`note-template.example.txt` lists every supported note-template variable. The built-in template records the source path and timestamp, content hash, audio duration, language, transcription backend/model/version, stage timings, summary model, and processing timestamp.
+`default-note-template.txt` is the single default template and lists every supported variable. It records the source path and timestamp, content hash, audio duration and quality measurements, language, transcription backend/model/version, stage timings, summary model, and processing timestamp. Copy it elsewhere and set `output.template` to customize it.
+
+The installer requires the hash-locked Python dependency set, validates at least 10 GB of free space, preserves a rollback copy of an existing environment, downloads configured models, runs a complete dependency check, and installs the LaunchAgent. Use `./setup.sh --upgrade` for an in-place Homebrew and Python-environment upgrade, `./setup.sh --uninstall` to remove automation only, or `./setup.sh --dry-run` to preview the transaction.
 
 ## Durable state
 
@@ -88,10 +95,11 @@ It contains:
 - `Transcripts`: durable raw, corrected, and segment-level transcripts.
 - `Summaries`: durable grounded summaries.
 - `Chunks`: per-recording transcription checkpoints; decoded temporary audio is removed after every chunk.
+- `Backups`: rotating pre-migration, pre-repair, and manual SQLite backups.
 - `state.sqlite3`: fingerprints, hashes, stages, errors, timings, and output paths.
 - `auto-transcription.log`: rotating diagnostic log.
 
-Copies use a `.partial` suffix until their size and hash have been verified. SQLite state and atomic file renames make interruption recovery idempotent. Recordings longer than 15 minutes are decoded into one bounded mono WAV chunk at a time with two seconds of overlap. Each completed chunk is checkpointed, so a crash or restart resumes without repeating it. Every MLX inference call runs in a fresh worker process; worker exit forces macOS to reclaim Metal allocations before the next chunk. Whisper is therefore gone before Ollama loads its model, and Ollama is explicitly unloaded after each recording. A summary or note failure does not cause Whisper to run again.
+Copies use a `.partial` suffix until repeated size/time checks, an audio-header check, a short decode, the complete copy size, and SHA-256 have all been verified. The first real recorder mount binds its volume UUID; later UUID mismatches are refused without reading audio. Copy failures use persistent exponential retry timing. SQLite state and atomic file renames make interruption recovery idempotent. Recordings longer than 15 minutes are decoded into one bounded mono WAV chunk at a time with two seconds of overlap. Each completed chunk is checkpointed, so a crash or restart resumes without repeating it. Every MLX inference call runs in a fresh worker process; worker exit forces macOS to reclaim Metal allocations before the next chunk. Whisper is therefore gone before Ollama loads its model, and Ollama is explicitly unloaded after each recording. A summary or note failure does not cause Whisper to run again.
 
 ## macOS automation
 
@@ -109,7 +117,7 @@ The command prints the `launchctl bootstrap` command needed to activate it. The 
 ./test_transcription.sh
 ```
 
-The isolated suite uses synthetic/mock transcription and summarization. It covers isolated MLX workers, bounded long-recording chunks, durable chunk resume, overlap de-duplication, model unloading, idempotency, duplicate content, reused filenames, Unicode paths, interrupted stages, copy retry, summary failure recovery, note collisions, archive cleanup, templates, attachment hash verification, selective accuracy retry, locking, timeouts, launchd output, and legacy-hash migration.
+The isolated suite uses synthetic/mock transcription and summarization. It covers isolated MLX workers, bounded long-recording chunks, durable chunk resume, overlap de-duplication, model unloading, idempotency, duplicate content, reused filenames, Unicode paths, interrupted stages, persistent copy retry, recorder UUID enforcement, audio readiness and quality reporting, run history, database backup/export/migration, safe maintenance, uninstall preservation, summary failure recovery, note collisions, archive cleanup, templates, attachment hash verification, selective accuracy retry, locking, timeouts, and launchd output.
 
 Run the real Apple Silicon integration check with generated spoken audio and the small test model:
 

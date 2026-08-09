@@ -1,8 +1,8 @@
 #!/bin/bash
 
-set -u
+set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-cd "$SCRIPT_DIR" || exit 1
+cd "$SCRIPT_DIR"
 if [ "${1:-}" = "--live" ]; then
     exec "$SCRIPT_DIR/test_live_transcription.sh"
 fi

@@ -5,15 +5,26 @@ vault = "~/Obsidian/Main"
 recordings_folder = "Recordings"
 state_root = "~/Library/Application Support/AutoTranscription"
 attachments_folder = "Recordings/Audio"
+# Optional. On first successful mount the script records the actual UUID and
+# refuses a different volume at the same path thereafter.
+recorder_volume_uuid = ""
 
 [import]
 archive_audio = true
 copy_audio_to_vault = false
 stable_wait_seconds = 1.0
+stable_check_count = 3
+readiness_probe_seconds = 1.0
 retry_count = 2
 copy_timeout_seconds = 1800
+retry_base_seconds = 300
+retry_max_seconds = 21600
 keep_audio = true
 discard_after_days = 0
+# Generated orphan state is retained briefly; failed audio is never deleted
+# automatically unless failed_retention_days is explicitly set above zero.
+orphan_retention_days = 7
+failed_retention_days = 0
 
 [transcription]
 backend = "auto"
@@ -31,6 +42,15 @@ vad_min_silence_seconds = 1.0
 vad_padding_seconds = 0.25
 # Optional FFmpeg audio filter. Leave empty unless testing proves it helps.
 audio_filter = ""
+# A blank transcript with measurable audio gets exactly one recovery pass with
+# VAD disabled, voice normalization, and this more accurate model.
+no_text_retry_model = "medium"
+no_text_retry_filter = "highpass=f=80,dynaudnorm=f=150:g=15"
+# Only peaks at or below this conservative threshold are classified as silent.
+silence_peak_db = -50.0
+quality_active_db = -45.0
+min_active_audio_seconds = 0.15
+clipping_peak_db = -0.1
 device = "auto"
 # Long audio is decoded and transcribed one bounded chunk at a time. These
 # defaults keep peak memory predictable on a 16 GB Apple Silicon Mac.
@@ -60,12 +80,14 @@ generate_title = false
 [behavior]
 notify = true
 prevent_sleep = true
-# After a non-dry-run `run` succeeds with zero failures, unmount the recorder volume.
+# After the same non-dry-run `run` finds new files and finishes with zero
+# failures, unmount the recorder volume. Empty polls always leave it mounted.
 unmount_on_success = true
 # 20 is macOS's lowest CPU scheduling priority; child processes inherit it.
 nice_level = 20
 log_max_bytes = 2000000
 log_backups = 3
+database_backups = 5
 
 [corrections]
 # "frequent mistranscription" = "preferred spelling"

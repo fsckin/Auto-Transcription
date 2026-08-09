@@ -1,6 +1,6 @@
 #!/bin/bash
 
-set -u
+set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PYTHON_BIN="$SCRIPT_DIR/.venv/bin/python"
 
@@ -13,15 +13,15 @@ if ! command -v say >/dev/null 2>&1 || ! command -v ffmpeg >/dev/null 2>&1; then
     exit 1
 fi
 
-TEST_ROOT="$(mktemp -d /tmp/auto-transcription-live.XXXXXX)" || exit 1
+TEST_ROOT="$(mktemp -d /tmp/auto-transcription-live.XXXXXX)"
 cleanup() {
     rm -rf "$TEST_ROOT"
 }
 trap cleanup EXIT INT TERM
 
-mkdir -p "$TEST_ROOT/recorder/REC_FILE" "$TEST_ROOT/vault" || exit 1
-say -o "$TEST_ROOT/spoken.aiff" "This is a local transcription pipeline test." || exit 1
-ffmpeg -hide_banner -loglevel error -i "$TEST_ROOT/spoken.aiff" "$TEST_ROOT/recorder/REC_FILE/LIVE_TEST.mp3" || exit 1
+mkdir -p "$TEST_ROOT/recorder/REC_FILE" "$TEST_ROOT/vault"
+say -o "$TEST_ROOT/spoken.aiff" "This is a local transcription pipeline test."
+ffmpeg -hide_banner -loglevel error -i "$TEST_ROOT/spoken.aiff" "$TEST_ROOT/recorder/REC_FILE/LIVE_TEST.mp3"
 
 "$PYTHON_BIN" "$SCRIPT_DIR/auto_transcription.py" \
     --mount "$TEST_ROOT/recorder" \
@@ -32,7 +32,7 @@ ffmpeg -hide_banner -loglevel error -i "$TEST_ROOT/spoken.aiff" "$TEST_ROOT/reco
     --no-summary \
     --no-vad \
     --no-notify \
-    run || exit 1
+    run
 
 TRANSCRIPT="$(find "$TEST_ROOT/state/Transcripts" -name '*.raw.txt' -type f -print -quit)"
 if [ -z "$TRANSCRIPT" ] || ! grep -Eiq 'local.*transcription.*pipeline.*test' "$TRANSCRIPT"; then
